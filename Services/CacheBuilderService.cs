@@ -25,6 +25,8 @@ public class CacheBuilderService
     private static readonly HashSet<char> InvalidCacheFolderChars = [.. Path.GetInvalidFileNameChars(), '/', '\\'];
     private const long MaxBundleSize = 1024L * 1024L * 1024L; // 1 GB bundle limit
 
+    // Bump when what goes into the bundles, or how it is laid out, changes: caches written with an older
+    // version are rebuilt once. 2: patterns merged, textures keep their compression, no catalog-first layout.
     private const int CacheLayoutVersion = 2;
     private const string CacheLayoutFile = "CacheLayout.txt";
 
@@ -52,6 +54,7 @@ public class CacheBuilderService
         Sim
     }
 
+    // Patterns are merged like any other CC: one package file per pattern costs the game an open file and an index each.
     private static SpecialPackageType DetectSpecialPackageType(DBPFPackage package)
     {
         foreach (var res in package.Resources)
@@ -92,6 +95,7 @@ public class CacheBuilderService
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
     private readonly LocalizationService _localizer;
+    // VaultService depends on this service, so it is resolved only when needed.
     private readonly IServiceProvider? _services;
 
     private string? _cachedSims3FolderPath;
@@ -506,6 +510,8 @@ public class CacheBuilderService
     private async Task<bool> WriteVaultResourceCfgAsync(string sims3ConfigDir, ConfigEntity? activeConfig)
     {
         var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToList() ?? new List<long>();
+        // Shards of other sets that hold an item the configuration includes on its own. Their indexes list only
+        // those items (VaultService.ApplyActiveConfigurationToShardsAsync), so nothing else of that set is loaded.
         var includedIds = activeConfig == null
             ? new List<long>()
             : await _db.ConfigItemOverrides.Where(o => o.ConfigEntityId == activeConfig.Id && o.Include).Select(o => o.MetaEntityId).ToListAsync();
@@ -539,6 +545,7 @@ public class CacheBuilderService
         return WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
     }
 
+    // Returns true if a folder was moved (Resource.cfg then has to be rewritten).
     public async Task<bool> UpgradeSetCacheFoldersAsync()
     {
         if (_options.EnableSingleSourceVault || string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase)) return false;
@@ -554,6 +561,7 @@ public class CacheBuilderService
             string setPath = GetSetPath(set);
             if (Directory.Exists(setPath))
             {
+                // Built by an older version: rebuild once with the current layout.
                 if (!set.Dirty && !HasCurrentLayout(setPath) && (set.MetaEntities?.Any(m => m.Enabled) ?? false))
                 {
                     set.Dirty = true;
@@ -609,7 +617,8 @@ public class CacheBuilderService
         catch { }
 
         var allSets = await _db.SetsEntities.Include(s => s.MetaEntities).ToListAsync();
-        // A set whose cache folder is gone (deleted by hand, or never built) is rebuilt even if it looks clean.
+        // A set whose cache folder is gone (deleted by hand, or never built) or was built by an older version
+        // is rebuilt even if it looks clean.
         var setsToRebuild = allSets
             .Where(s => forceRebuild || s.Dirty || ((s.MetaEntities?.Any(m => m.Enabled) ?? false) && !HasCurrentLayout(GetSetPath(s))))
             .ToList();
@@ -830,11 +839,13 @@ public class CacheBuilderService
 
         // Sort items by PackageType category so that CAS items, BuildBuy items, etc., are clustered into contiguous bundles.
         // One entry per item: different mods may share a file name (in different library sub-folders).
+        // Items the configuration includes from other sets come along; the ones it excludes stay out.
         var scope = activeConfig == null
             ? new ConfigurationScope(activeSets.Select(s => s.Id).ToHashSet(), new Dictionary<long, bool>())
             : await ConfigurationScope.LoadAsync(_db, activeConfig.Id, activeSets.Select(s => s.Id));
-        var includedElsewhere = scope.Overrides.Any(o => o.Value)
-            ? await _db.MetaEntities.Where(m => m.HasConfigOverrides && m.Enabled).ToListAsync()
+        var includedIds = scope.Overrides.Where(o => o.Value).Select(o => o.Key).ToList();
+        var includedElsewhere = includedIds.Count > 0
+            ? await _db.MetaEntities.Where(m => m.Enabled && includedIds.Contains(m.ParentMetaEntityId ?? m.Id)).ToListAsync()
             : new List<MetaEntity>();
         var allMetaItems = activeSets
             .SelectMany(s => s.MetaEntities ?? new List<MetaEntity>())
@@ -941,6 +952,7 @@ public class CacheBuilderService
         return sb.ToString();
     }
 
+    // Named after the set's id so renaming or moving a set never invalidates its cache.
     public static string GetSetFolderName(long setId) => $"Set_{setId}";
 
     public string GetSetFolderName(SetsEntity activeSet, Dictionary<long, SetsEntity>? allSetsMap = null) => GetSetFolderName(activeSet.Id);
@@ -998,7 +1010,9 @@ public class CacheBuilderService
         string setPath = GetSetPath(activeSet);
         Directory.CreateDirectory(setPath);
 
-        var metaEntities = (activeSet.MetaEntities?.Where(m => m.Enabled && !m.HasConfigOverrides) ?? Enumerable.Empty<MetaEntity>())
+        // Items some configuration excludes go into the configuration item cache instead: the game loads everything in a
+        // bundle, so they can't stay here. Items that are only ever included stay; they get a copy where their set is off.
+        var metaEntities = (activeSet.MetaEntities?.Where(m => m.Enabled && !m.ExcludedByAnyConfig) ?? Enumerable.Empty<MetaEntity>())
             .OrderBy(m => GetPackageTypePriority(m.PackageType))
             .ThenBy(m => m.PackageType)
             .ThenBy(m => m.FileName)
@@ -1038,17 +1052,22 @@ public class CacheBuilderService
         activeSet.Dirty = false;
     }
 
+    // Everything the active configuration loads that no loaded set bundle already holds: items it includes from sets
+    // it leaves off, and excluded-somewhere items (left out of every set bundle) that it loads. Set bundles never
+    // depend on the configuration, so switching configurations or changing includes only rebuilds this small folder.
     public const string ConfigItemsFolderName = "ConfigItems";
 
     private const string ConfigItemsHashFile = "BuildHash.txt";
 
     private async Task<List<MetaEntity>> GetConfigItemsAsync(ConfigurationScope scope)
     {
+        var includedIds = scope.Overrides.Where(o => o.Value).Select(o => o.Key).ToList();
         var candidates = await _db.MetaEntities
-            .Where(m => m.HasConfigOverrides && m.Enabled)
+            .Where(m => m.Enabled && (m.ExcludedByAnyConfig || includedIds.Contains(m.ParentMetaEntityId ?? m.Id)))
             .ToListAsync();
         return candidates
             .Where(scope.Includes)
+            .Where(m => m.ExcludedByAnyConfig || !(m.SetsEntityId.HasValue && scope.SetIds.Contains(m.SetsEntityId.Value)))
             .OrderBy(m => GetPackageTypePriority(m.PackageType))
             .ThenBy(m => m.PackageType)
             .ThenBy(m => m.FileName)
@@ -1151,6 +1170,8 @@ public class CacheBuilderService
         }
     }
 
+    // Merged in list order so the same copy of a duplicated resource wins every rebuild.
+    // Reading and preparing can run in parallel; merging never does.
     private void MergeItems(IReadOnlyList<MetaEntity> items, MergeContext ctx, bool parallel, Action<int> onItemDone)
     {
         DBPFPackageBuilder? outputPkg = null;
@@ -1322,6 +1343,7 @@ public class CacheBuilderService
                 try { File.Move(path, Path.ChangeExtension(path, ".package"), overwrite: true); } catch { }
             }
 
+            // Older versions exported patterns as separate files; they are merged into the bundles now.
             foreach (string path in Directory.GetFiles(ctx.OutputDir, "Pattern_*.package"))
             {
                 try { File.Delete(path); } catch { }
@@ -1353,6 +1375,8 @@ public class CacheBuilderService
         }
     }
 
+    // Resources keep the compression the creator shipped them with: storing them decompressed made caches
+    // about three times larger.
     private void PreparePackageResources(DBPFPackage package, TextureOptimizationCache? textureCache = null, HashSet<TGI_Key>? disabledObjects = null)
     {
         var resources = package.Resources;
@@ -1407,6 +1431,7 @@ public class CacheBuilderService
                 if (outputPkg == null)
                 {
                     string path = Path.Combine(targetDirectory, $"{bundlePrefix}{packageCount++}.new");
+                    // Resources stay in the order they are added, each mod's resources together (as CC Magic writes them).
                     outputPkg = new DBPFPackageBuilder(path, false);
                 }
 
@@ -1531,6 +1556,8 @@ public class CacheBuilderService
         }
     }
 
+    // Named after the item's own file: the name stored inside these packages is not a plain string, and parsing
+    // it as one produced names like "_" and "__1". The caller holds NonPackageExportLock.
     private string ExportNonPackage(DBPFPackage package, string subDir, string baseName, string extension, ISet<string> claimed)
     {
         string dir = Path.Combine(_options.DocumentBaseDir, subDir);

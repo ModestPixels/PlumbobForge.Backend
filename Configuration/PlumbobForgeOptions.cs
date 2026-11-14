@@ -27,13 +27,17 @@ public class PlumbobForgeOptions
     public bool EnableSingleSourceVault { get; set; } = false;
     public bool AutoRebuildStaticCache { get; set; } = false;
     public bool EnableAutoScan { get; set; } = true;
+    // Off by default: deleting compositorCache/simCompositorCache makes the game rebuild textures while it runs (stutter).
     public bool AutoClearGameCaches { get; set; } = false;
     public bool OptimizeTextures { get; set; } = false;
+    // 0 means no cap.
     public int TextureMaxDimension { get; set; } = 2048;
     public System.Collections.Generic.List<string> ObservedFolders { get; set; } = new();
     public System.Collections.Generic.List<string> CustomColorPresets { get; set; } = new();
     public string LogsFolderName { get; set; } = "Logs";
     public string LastActiveTool { get; set; } = "Cache";
+    // Tool sections pinned as their own title-bar tabs, in pin order.
+    public System.Collections.Generic.List<string> PinnedTools { get; set; } = new();
     public int LastOptimizedCacheMilestone { get; set; } = 0;
     public string LastOptimizedCacheVersion { get; set; } = "";
 

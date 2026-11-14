@@ -28,7 +28,8 @@ public static class SetDirtyTracker
             // Only appended when set, so hashes of existing sets stay the same.
             if (item.SkipTextureOptimization) sb.Append(":NT");
             if (item.DisabledObjectCount > 0) sb.Append(":X").Append(item.DisabledObjectsStamp);
-            if (item.HasConfigOverrides) sb.Append(":CO");
+            // Such items are built into the configuration item cache, not the set's.
+            if (item.ExcludedByAnyConfig) sb.Append(":CO");
             sb.Append(';');
         }
 

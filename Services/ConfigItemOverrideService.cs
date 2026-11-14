@@ -115,7 +115,6 @@ public class ConfigItemOverrideService
         return new ConfigItemRuleResult(config.Active, dirtied);
     }
 
-    /// <summary>Copies one configuration's rules to another (used when duplicating a configuration).</summary>
     public async Task CopyRulesAsync(long fromConfigId, long toConfigId)
     {
         var rules = await _db.ConfigItemOverrides.AsNoTracking().Where(o => o.ConfigEntityId == fromConfigId).ToListAsync();
@@ -132,10 +131,12 @@ public class ConfigItemOverrideService
             .Where(o => o.ConfigEntityId == configId)
             .ToDictionaryAsync(o => o.MetaEntityId, o => o.Include);
 
+    // Only excludes take an item out of its set's bundle, so only a change in "excluded by some configuration" makes a
+    // set rebuild. Includes are served from the configuration item cache and leave the set alone.
     public async Task<int> RefreshOverrideFlagsAsync(IEnumerable<long>? topLevelIds = null)
     {
         var ids = topLevelIds?.ToList();
-        var withRules = (await _db.ConfigItemOverrides.Select(o => o.MetaEntityId).Distinct().ToListAsync()).ToHashSet();
+        var excluded = (await _db.ConfigItemOverrides.Where(o => !o.Include).Select(o => o.MetaEntityId).Distinct().ToListAsync()).ToHashSet();
 
         var items = await _db.MetaEntities
             .Where(m => ids == null || ids.Contains(m.Id) || (m.ParentMetaEntityId.HasValue && ids.Contains(m.ParentMetaEntityId.Value)))
@@ -144,9 +145,9 @@ public class ConfigItemOverrideService
         var changedSetIds = new HashSet<long>();
         foreach (var item in items)
         {
-            bool flag = withRules.Contains(item.ParentMetaEntityId ?? item.Id);
-            if (item.HasConfigOverrides == flag) continue;
-            item.HasConfigOverrides = flag;
+            bool flag = excluded.Contains(item.ParentMetaEntityId ?? item.Id);
+            if (item.ExcludedByAnyConfig == flag) continue;
+            item.ExcludedByAnyConfig = flag;
             if (item.SetsEntityId.HasValue) changedSetIds.Add(item.SetsEntityId.Value);
         }
 
@@ -159,7 +160,7 @@ public class ConfigItemOverrideService
             var sets = await _db.SetsEntities.Include(s => s.MetaEntities).Where(s => changedSetIds.Contains(s.Id)).ToListAsync();
             foreach (var set in sets)
             {
-                // The flag only decides which cache folder a dynamic library build puts the item in. Vault mode and the
+                // The flag only decides whether a dynamic set bundle holds the item. Vault mode and the
                 // static bundle do not care, so a set that was clean stays clean there.
                 if (vault || isStatic)
                 {

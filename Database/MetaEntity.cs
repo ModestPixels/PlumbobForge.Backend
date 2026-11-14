@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace PlumbobForge.Backend.Database;
 
@@ -34,7 +35,12 @@ public class MetaEntity
     public bool SkipTextureOptimization { get; set; } = false;
     public int DisabledObjectCount { get; set; }
     public string? DisabledObjectsStamp { get; set; }
-    public bool HasConfigOverrides { get; set; }
+    // Set when some configuration excludes this item. A dynamic library cache then leaves it out of its set's bundle
+    // (the game loads everything in a bundle) and builds it into the configuration item cache when it is loaded.
+    // Includes alone never set it: the item stays in its set's bundle and gets a copy only where its set is off.
+    // The column keeps its old name, from when any rule set it.
+    [Column("HasConfigOverrides")]
+    public bool ExcludedByAnyConfig { get; set; }
 
     public long? SetsEntityId { get; set; }
     public SetsEntity? SetsEntity { get; set; }
