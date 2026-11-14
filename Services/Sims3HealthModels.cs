@@ -205,6 +205,7 @@ public class PatternIssueItem
     public string SetName { get; set; } = "Uncategorized";
     public long? SetId { get; set; }
     public long? MetaEntityId { get; set; }
+    public bool IsVaultItem { get; set; }
     public string PatternName { get; set; } = "Unknown Pattern";
     public string Category { get; set; } = "General";
     public int CorruptedKeyCount { get; set; }

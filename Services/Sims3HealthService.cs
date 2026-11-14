@@ -26,18 +26,22 @@ public class Sims3HealthService
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private readonly CacheBuilderService _cacheBuilderService;
     private readonly LocalizationService _localizer;
+    // VaultService depends on this service (through Sims3HiderService), so it is resolved only when needed.
+    private readonly IServiceProvider? _services;
     private PlumbobForgeOptions Options => _optionsMonitor.CurrentValue;
 
     public Sims3HealthService(
         AppDbContext db,
         IOptionsMonitor<PlumbobForgeOptions> optionsMonitor,
         CacheBuilderService cacheBuilderService,
-        LocalizationService localizer)
+        LocalizationService localizer,
+        IServiceProvider? services = null)
     {
         _db = db;
         _optionsMonitor = optionsMonitor;
         _cacheBuilderService = cacheBuilderService;
         _localizer = localizer;
+        _services = services;
     }
 
     public string GetSims3FolderPath()
@@ -906,9 +910,10 @@ public class Sims3HealthService
 
     #region Pattern Fixer Logic
 
-    private static readonly Regex PatternKeyRegex = new(
-        @"((?:key:|<reskey>\s*\d+\s*:)\s*[0-9a-fA-F]{8}\s*:\s*[0-9a-fA-F]{8}\s*):\s+([0-9a-fA-F]+)",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private const uint PatternResourceType = 0xD4D9FBE5u;
+
+    // A vault item's pattern-related resources, read from its shard instead of opening the shard as a package.
+    private sealed record VaultPatternChunk(long MetaEntityId, long ShardId, uint Type, long Offset, int ChunkLength, int ResourceLength, bool IsCompressed);
 
     private static readonly Regex ComplateNameRegex = new(
         @"<complate\s+[^>]*name=""([^""]+)""(?:[^>]*category=""([^""]+)"")?",
@@ -939,74 +944,93 @@ public class Sims3HealthService
                 CancellationToken = cancellationToken
             };
 
+            // A vault item's CompleteFileName is its shard, which holds many other items: vault items are read
+            // through their own chunks instead.
+            var vaultPatternChunks = LoadVaultPatternChunks();
+            var shardPaths = LoadShardPaths(vaultPatternChunks.Values.SelectMany(l => l).Select(c => c.ShardId).ToHashSet());
+
             Parallel.ForEach(metaItems, parallelOptions, item =>
             {
                 if (cancellationToken.IsCancellationRequested) return;
                 string filePath = item.CompleteFileName;
-                if (!File.Exists(filePath)) return;
-
-                // Only inspect DBPF (.package) files directly
-                if (filePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase)) return;
 
                 try
                 {
-                    using var pkg = new DBPFPackage(filePath);
-                    if (pkg.Resources.Count == 0) return;
+                    List<string> texts;
+                    if (item.IsVaultManaged)
+                    {
+                        if (!vaultPatternChunks.TryGetValue(item.Id, out var chunks)) return;
+                        texts = new List<string>();
+                        foreach (var c in chunks)
+                        {
+                            if (!shardPaths.TryGetValue(c.ShardId, out var shardPath)) return;
+                            try
+                            {
+                                texts.Add(Encoding.UTF8.GetString(DBPFVaultShard.ReadDecompressedChunk(shardPath, c.Offset, c.ChunkLength, c.ResourceLength, c.IsCompressed)));
+                            }
+                            catch
+                            {
+                                // Unreadable chunk: skip it.
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (!File.Exists(filePath)) return;
+                        // Only inspect DBPF (.package) files directly
+                        if (filePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase)) return;
 
-                    // Check if package has pattern definition resource (Type 0xD4D9FBE5 - PTRN)
-                    bool hasPatternResource = pkg.Resources.Any(r => r.Key.Type == 0xD4D9FBE5);
+                        using var pkg = new DBPFPackage(filePath);
+                        // Only packages with a pattern definition resource (PTRN)
+                        if (!pkg.Resources.Any(r => r.Key.Type == PatternResourceType)) return;
 
-                    if (!hasPatternResource) return;
+                        texts = new List<string>();
+                        foreach (var res in pkg.Resources)
+                        {
+                            if (!PatternKeyRepair.AppliesTo(res.Key.Type)) continue;
+                            try
+                            {
+                                texts.Add(Encoding.UTF8.GetString(res.Read()));
+                            }
+                            catch
+                            {
+                                // Decompression error on a single resource
+                            }
+                        }
+                    }
 
                     string patternName = Path.GetFileNameWithoutExtension(item.FileName);
                     string category = "General";
                     int brokenKeysCount = 0;
                     var brokenSamples = new List<string>();
 
-                    foreach (var res in pkg.Resources)
+                    foreach (string text in texts)
                     {
-                        // Inspect XML resources: 0x0333406C, 0xD4D9FBE5, 0x73E93EEB
-                        if (res.Key.Type == 0x0333406C || res.Key.Type == 0xD4D9FBE5 || res.Key.Type == 0x73E93EEB)
+                        // Try extract pattern name and category
+                        var complateMatch = ComplateNameRegex.Match(text);
+                        if (complateMatch.Success)
                         {
-                            try
+                            if (!string.IsNullOrWhiteSpace(complateMatch.Groups[1].Value))
+                                patternName = complateMatch.Groups[1].Value.Trim();
+                            if (complateMatch.Groups.Count > 2 && !string.IsNullOrWhiteSpace(complateMatch.Groups[2].Value))
+                                category = complateMatch.Groups[2].Value.Trim();
+                        }
+                        else
+                        {
+                            var plMatch = PatternlistNameRegex.Match(text);
+                            if (plMatch.Success && !string.IsNullOrWhiteSpace(plMatch.Groups[1].Value))
                             {
-                                byte[] bytes = res.Read();
-                                string text = Encoding.UTF8.GetString(bytes);
-
-                                // Try extract pattern name and category
-                                var complateMatch = ComplateNameRegex.Match(text);
-                                if (complateMatch.Success)
-                                {
-                                    if (!string.IsNullOrWhiteSpace(complateMatch.Groups[1].Value))
-                                        patternName = complateMatch.Groups[1].Value.Trim();
-                                    if (complateMatch.Groups.Count > 2 && !string.IsNullOrWhiteSpace(complateMatch.Groups[2].Value))
-                                        category = complateMatch.Groups[2].Value.Trim();
-                                }
-                                else
-                                {
-                                    var plMatch = PatternlistNameRegex.Match(text);
-                                    if (plMatch.Success && !string.IsNullOrWhiteSpace(plMatch.Groups[1].Value))
-                                    {
-                                        patternName = plMatch.Groups[1].Value.Trim();
-                                    }
-                                }
-
-                                var matches = PatternKeyRegex.Matches(text);
-                                if (matches.Count > 0)
-                                {
-                                    brokenKeysCount += matches.Count;
-                                    foreach (Match m in matches)
-                                    {
-                                        if (brokenSamples.Count < 5)
-                                        {
-                                            brokenSamples.Add(m.Value);
-                                        }
-                                    }
-                                }
+                                patternName = plMatch.Groups[1].Value.Trim();
                             }
-                            catch
+                        }
+
+                        var matches = PatternKeyRepair.FindBrokenKeys(text);
+                        brokenKeysCount += matches.Count;
+                        foreach (Match m in matches)
+                        {
+                            if (brokenSamples.Count < 5)
                             {
-                                // Decompression or parsing error on single resource
+                                brokenSamples.Add(m.Value);
                             }
                         }
                     }
@@ -1018,6 +1042,7 @@ public class Sims3HealthService
                         SetName = item.SetsEntity?.Name ?? "Uncategorized",
                         SetId = item.SetsEntityId,
                         MetaEntityId = item.Id,
+                        IsVaultItem = item.IsVaultManaged,
                         PatternName = patternName,
                         Category = category,
                         CorruptedKeyCount = brokenKeysCount,
@@ -1060,9 +1085,90 @@ public class Sims3HealthService
         }, cancellationToken);
     }
 
+    // Pattern-related resources of vault items that have a pattern definition, by item.
+    private Dictionary<long, List<VaultPatternChunk>> LoadVaultPatternChunks()
+    {
+        return _db.VaultChunks.AsNoTracking()
+            .Where(c => c.MetaEntity!.IsVaultManaged
+                && (c.Type == 0x0333406Cu || c.Type == PatternResourceType || c.Type == CacheContentRules.ManifestType))
+            .Select(c => new { c.MetaEntityId, c.VaultShardId, c.Type, c.Offset, c.ChunkLength, c.ResourceLength, c.IsCompressed })
+            .AsEnumerable()
+            .Select(c => new VaultPatternChunk(c.MetaEntityId, c.VaultShardId, c.Type, c.Offset, c.ChunkLength, c.ResourceLength, c.IsCompressed))
+            .GroupBy(c => c.MetaEntityId)
+            .Where(g => g.Any(c => c.Type == PatternResourceType))
+            .ToDictionary(g => g.Key, g => g.ToList());
+    }
+
+    private Dictionary<long, string> LoadShardPaths(HashSet<long> shardIds)
+    {
+        if (shardIds.Count == 0) return new Dictionary<long, string>();
+        string vaultRoot = VaultService.GetVaultRootDirectory(GetSims3FolderPath());
+        return _db.VaultShards.AsNoTracking()
+            .Include(s => s.SetsEntity)
+            .Where(s => shardIds.Contains(s.Id))
+            .AsEnumerable()
+            .ToDictionary(s => s.Id, s => VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity));
+    }
+
+    // Vault items are repaired inside their shard; a library item's own file is rewritten.
+    public async Task<bool> FixPatternItemAsync(PatternIssueItem item)
+    {
+        if (item.IsVaultItem)
+        {
+            if (item.MetaEntityId == null || _services?.GetService(typeof(VaultService)) is not VaultService vault) return false;
+            try
+            {
+                return await vault.RepairPatternKeysAsync(item.MetaEntityId.Value) >= 0;
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Failed to fix vault pattern item {item.MetaEntityId}: {ex.Message}");
+                return false;
+            }
+        }
+        return await Task.Run(() => FixPatternPackage(item.PackagePath));
+    }
+
+    public async Task<PatternFixResult> FixPatternItemsAsync(IEnumerable<PatternIssueItem> items, IProgress<int>? progress = null)
+    {
+        var result = new PatternFixResult();
+        // Vault items share their shard path, so they are told apart by item, library files by path.
+        var list = items
+            .GroupBy(i => i.IsVaultItem ? $"vault:{i.MetaEntityId}" : $"file:{i.PackagePath}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+        int current = 0;
+
+        foreach (var item in list)
+        {
+            if (await FixPatternItemAsync(item))
+            {
+                result.FixedCount++;
+            }
+            else
+            {
+                result.FailedCount++;
+                result.Errors.Add($"Failed to repair: {item.FileName}");
+            }
+            current++;
+            progress?.Report((int)((double)current / list.Count * 100));
+        }
+
+        result.Success = result.FailedCount == 0;
+        return result;
+    }
+
     public bool FixPatternPackage(string packagePath)
     {
         if (!File.Exists(packagePath)) return false;
+
+        // A vault shard holds many items and its layout belongs to the database: rewriting it as a package would
+        // drop every chunk outside its index and break every stored offset. Vault items go through FixPatternItemAsync.
+        if (_db.MetaEntities.AsNoTracking().Any(m => m.IsVaultManaged && m.CompleteFileName == packagePath))
+        {
+            log.Warn($"Refusing to rewrite vault shard {packagePath} as a package");
+            return false;
+        }
 
         string tempPath = packagePath + ".tmp_fix";
         try
@@ -1077,18 +1183,12 @@ public class Sims3HealthService
                 {
                     foreach (var res in pkg.Resources)
                     {
-                        if (res.Key.Type == 0x0333406C || res.Key.Type == 0xD4D9FBE5 || res.Key.Type == 0x73E93EEB)
+                        if (PatternKeyRepair.AppliesTo(res.Key.Type))
                         {
                             try
                             {
-                                byte[] bytes = res.Read();
-                                string text = Encoding.UTF8.GetString(bytes);
-
-                                if (PatternKeyRegex.IsMatch(text))
+                                if (PatternKeyRepair.TryRepair(res.Read(), out byte[] fixedBytes))
                                 {
-                                    string fixedText = PatternKeyRegex.Replace(text, "$1:$2");
-                                    byte[] fixedBytes = Encoding.UTF8.GetBytes(fixedText);
-
                                     using var ms = new MemoryStream(fixedBytes);
                                     var newRes = new ResourceEntry(ms, res.Key);
                                     if (res.IsCompressed)
@@ -1128,34 +1228,6 @@ public class Sims3HealthService
         }
     }
 
-    public async Task<PatternFixResult> FixPatternPackagesAsync(IEnumerable<string> packagePaths, IProgress<int>? progress = null)
-    {
-        return await Task.Run(() =>
-        {
-            var result = new PatternFixResult();
-            var pathsList = packagePaths.Distinct().ToList();
-            int current = 0;
-
-            foreach (var path in pathsList)
-            {
-                bool ok = FixPatternPackage(path);
-                if (ok)
-                {
-                    result.FixedCount++;
-                }
-                else
-                {
-                    result.FailedCount++;
-                    result.Errors.Add($"Failed to repair: {Path.GetFileName(path)}");
-                }
-                current++;
-                progress?.Report((int)((double)current / pathsList.Count * 100));
-            }
-
-            result.Success = result.FailedCount == 0;
-            return result;
-        });
-    }
 
     #endregion
 }

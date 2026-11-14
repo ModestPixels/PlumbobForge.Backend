@@ -22,7 +22,7 @@ public sealed class TextureOptimizationCache
         Directory.CreateDirectory(_dir);
     }
 
-    public OptimizedTexture? GetOrCreate(byte[] rawChunk, Func<byte[]> decompress)
+    public OptimizedTexture? GetOrCreate(byte[] rawChunk, bool isCompressed, Func<byte[]> decompress)
     {
         string key = Convert.ToHexString(SHA256.HashData(rawChunk), 0, 16);
         string sub = Path.Combine(_dir, key.Substring(0, 2));
@@ -52,7 +52,7 @@ public sealed class TextureOptimizationCache
         }
 
         byte[]? dds = TextureOptimizer.TryOptimize(decompress(), _maxDimension);
-        OptimizedTexture? optimized = dds != null ? TextureOptimizer.Pack(dds) : null;
+        OptimizedTexture? optimized = dds != null ? TextureOptimizer.Pack(dds, isCompressed) : null;
 
         try
         {
