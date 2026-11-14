@@ -27,7 +27,6 @@ public sealed class InspectedResource
     internal string? ShardPath { get; init; }
 }
 
-/// <param name="MetaEntityId">Vault mode: the item whose chunks make up this package (a child item for a Sims3Pack).</param>
 public sealed record InspectedPart(int Index, string Label, int ResourceCount, long Bytes, long? MetaEntityId = null);
 
 public sealed record PartEdits(int PartIndex, long? MetaEntityId, IReadOnlyList<ResourceEdit> Edits);
@@ -37,6 +36,7 @@ public sealed record ObjectToggle(TGI_Key Key, bool Enabled);
 public sealed class InspectedThumbnail
 {
     public required InspectedResource Resource { get; init; }
+    // 0 small, 1 medium, 2 large, 3 extra large.
     public int SizeIndex { get; init; }
     public uint FamilyBase { get; init; }
     public uint Group => Resource.Key.Group;
@@ -62,8 +62,11 @@ public sealed class InspectedObject
     public uint CasCategory { get; set; }
 
     public bool CouldNotRead { get; set; }
+    // Saving an edit keeps a single copy of a duplicated key, so such a resource is never edited itself.
     public bool HasDuplicateKey { get; set; }
     public bool IsDisabled { get; set; }
+    // Filled in separately by MeshStatsService, because reading meshes takes a while.
+    public MeshStats? Mesh { get; set; }
     public List<InspectedThumbnail> Thumbnails { get; } = new();
 }
 
