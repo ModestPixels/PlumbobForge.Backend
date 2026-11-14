@@ -18,16 +18,6 @@ namespace PlumbobForge.Backend.Services;
 
 public record VaultMigrationBatchResult(int MigratedCount, long BytesReclaimed, List<long> MigratedIds, List<string> Failures);
 
-/// <summary>
-/// Single-source vault: mods live as chunks inside per-set DBPF shards under Mods/PF_Vault/Set_{id}/.
-///
-/// The database is the source of truth; a shard's DBPF index is derived from it (enabled mods only).
-/// Every operation follows the same order so a crash never loses data:
-///   1. write new chunk bytes (appending never overwrites committed data),
-///   2. commit the database,
-///   3. rewrite the affected shard indexes from the database,
-///   4. only then punch holes over chunks nothing references any more.
-/// </summary>
 public class VaultService
 {
     private static readonly ILog log = LogManager.GetLogger(nameof(VaultService));
@@ -51,10 +41,8 @@ public class VaultService
     private readonly Sims3HiderService _hiderService;
     private PlumbobForgeOptions Options => _optionsMonitor.CurrentValue;
 
-    /// <summary>Profile of the configured texture settings, whether or not optimisation is switched on.</summary>
     private int ConfiguredTextureProfile => TextureOptimizer.GetProfile(Options.TextureMaxDimension);
 
-    /// <summary>Profile whose optimised copies the game should see, or 0 when optimisation is off.</summary>
     private int ActiveTextureProfile => Options.OptimizeTextures ? ConfiguredTextureProfile : 0;
 
     public VaultService(
@@ -94,10 +82,8 @@ public class VaultService
         return vaultDir;
     }
 
-    /// <summary>Folder of a set's shards. Keyed by set Id so it is unique and never changes on rename.</summary>
     public static string GetSetFolderName(long setId) => $"Set_{setId}";
 
-    /// <summary>Folder name used before shards were keyed by set Id (derived from the set's name).</summary>
     public static string GetLegacySetFolderName(SetsEntity? set)
     {
         string folderSlug = set != null && !string.IsNullOrWhiteSpace(set.FolderName)
@@ -119,7 +105,6 @@ public class VaultService
     private static bool IsLegacyRelativePath(string relativePath) =>
         relativePath.IndexOf('/') < 0 && relativePath.IndexOf('\\') < 0;
 
-    /// <summary>Resolves a shard's file path without a database or service instance (used by the cache builder).</summary>
     public static string ResolveShardPath(string vaultRootDir, VaultShardEntity shard, SetsEntity? set)
     {
         if (IsLegacyRelativePath(shard.RelativePath))
@@ -131,7 +116,6 @@ public class VaultService
 
     public string GetShardDirectory(SetsEntity set) => Path.Combine(GetVaultRootDirectory(), GetSetFolderName(set.Id));
 
-    /// <summary>Full path of a shard. Always resolved against the shard's own set.</summary>
     public string GetShardFullPath(VaultShardEntity shard)
     {
         var set = shard.SetsEntity;
@@ -146,10 +130,6 @@ public class VaultService
 
     #region Shared helpers
 
-    /// <summary>
-    /// The index a shard should have: the chunks of enabled items the active configuration loads (see
-    /// <see cref="ConfigurationScope"/>). Also records on the tracked shard which rules this index follows.
-    /// </summary>
     private async Task<List<VaultChunkEntry>> GetIndexedChunksAsync(long shardId, ConfigurationScope? scope = null)
     {
         int profile = ActiveTextureProfile;
@@ -165,9 +145,19 @@ public class VaultService
         var tracked = _db.VaultShards.Local.FirstOrDefault(s => s.Id == shardId);
         if (tracked != null) tracked.IndexScope = scope.GetShardIndexScope(shardSetId, rows.Select(r => r.ItemId));
 
+        // Packages (Sims3Pack parts) holding the object that crashes the game are never loaded, as in a library cache.
+        var crashingParts = rows
+            .Where(r => new TGI_Key(r.Chunk.Type, r.Chunk.Group, r.Chunk.Instance).Equals(CacheContentRules.CrashingObjectKey))
+            .Select(r => r.Chunk.MetaEntityId)
+            .ToHashSet();
+
         return rows
             .Where(r => scope.Includes(r.ItemId, r.SetId ?? shardSetId))
             .Where(r => !disabled.Contains((r.ItemId, r.Chunk.Type, r.Chunk.Group, r.Chunk.Instance)))
+            .Where(r => CacheContentRules.IsLoadableType(r.Chunk.Type) && !crashingParts.Contains(r.Chunk.MetaEntityId))
+            // One copy of each resource: the item imported first wins, and keeps winning after any rewrite.
+            .GroupBy(r => (r.Chunk.Type, r.Chunk.Group, r.Chunk.Instance))
+            .Select(g => g.OrderBy(r => r.ItemId).ThenBy(r => r.Chunk.MetaEntityId).ThenBy(r => r.Chunk.Id).First())
             .Select(r => ToIndexEntry(r.Chunk, profile, r.Skip))
             .ToList();
     }
@@ -245,6 +235,7 @@ public class VaultService
 
     public static bool HasPendingIndexSync => !_pendingIndexSync.IsEmpty;
 
+    // Call after SaveChanges. Returns false when the game holds the file open; it is retried after it exits.
     private async Task<bool> SyncShardIndexAsync(VaultShardEntity shard)
     {
         string path = GetShardFullPath(shard);
@@ -299,6 +290,8 @@ public class VaultService
         return allDone;
     }
 
+    // While the game runs it may still read these regions through the index it loaded at startup,
+    // so they are only recorded as pending and zeroed by PunchPendingHolesAsync once it has exited.
     private void ReleaseChunkRegions(VaultShardEntity shard, IReadOnlyCollection<(long Offset, int Length)> regions, bool deferPunch = false)
     {
         if (regions.Count == 0) return;
@@ -406,7 +399,55 @@ public class VaultService
         }).ToList();
 
     private static List<RawChunkPayload> ReadPackagePayloads(DBPFPackage package, long metaId, bool indexed) =>
-        package.Resources.Select(res => new RawChunkPayload(res.Key, res.ReadRaw(), (int)res.Length, res.IsCompressed, metaId) { Indexed = indexed }).ToList();
+        package.Resources.Select(res => ReadPayload(res, metaId, indexed)).ToList();
+
+    // Pattern reskeys are repaired on the way in (the Pattern Fixer's rule); repaired XML is stored uncompressed.
+    private static RawChunkPayload ReadPayload(ResourceEntry res, long metaId, bool indexed)
+    {
+        if (PatternKeyRepair.AppliesTo(res.Key.Type))
+        {
+            try
+            {
+                if (PatternKeyRepair.TryRepair(res.Read(), out var repaired))
+                {
+                    return new RawChunkPayload(res.Key, repaired, repaired.Length, false, metaId) { Indexed = indexed };
+                }
+            }
+            catch
+            {
+                // Unreadable: store it as it is.
+            }
+        }
+        return new RawChunkPayload(res.Key, res.ReadRaw(), (int)res.Length, res.IsCompressed, metaId) { Indexed = indexed };
+    }
+
+    // Repairs the pattern reskeys of one vault item in place. Returns the number of resources repaired, or -1 on failure.
+    public async Task<int> RepairPatternKeysAsync(long metaEntityId)
+    {
+        var meta = await _db.MetaEntities.AsNoTracking().FirstOrDefaultAsync(m => m.Id == metaEntityId);
+        if (meta == null || !meta.IsVaultManaged || meta.VaultShardId == null) return -1;
+        var shard = await LoadShardAsync(meta.VaultShardId.Value);
+        if (shard == null) return -1;
+        string shardPath = GetShardFullPath(shard);
+        if (!File.Exists(shardPath)) return -1;
+
+        var chunks = await _db.VaultChunks.AsNoTracking()
+            .Where(c => c.MetaEntityId == metaEntityId && (c.Type == 0x0333406Cu || c.Type == 0xD4D9FBE5u || c.Type == CacheContentRules.ManifestType))
+            .ToListAsync();
+
+        var edits = new List<ResourceEdit>();
+        foreach (var c in chunks)
+        {
+            byte[] plain = DBPFVaultShard.ReadDecompressedChunk(shardPath, c.Offset, c.ChunkLength, c.ResourceLength, c.IsCompressed);
+            if (PatternKeyRepair.TryRepair(plain, out var repaired))
+            {
+                edits.Add(new ResourceEdit(new TGI_Key(c.Type, c.Group, c.Instance), repaired));
+            }
+        }
+
+        if (edits.Count == 0) return 0;
+        return await ApplyResourceEditsAsync(metaEntityId, edits) ? edits.Count : -1;
+    }
 
     private static long EstimateBytes(IReadOnlyCollection<RawChunkPayload> chunks) =>
         chunks.Sum(c => (long)c.ChunkLength) + (chunks.Count * 32L) + 1024;
@@ -1563,7 +1604,7 @@ public class VaultService
                             plain = GC.AllocateUninitializedArray<byte>(c.ResourceLength);
                             if (!Compression.Decompress(raws[i], plain)) return;
                         }
-                        if (TextureOptimizer.TryOptimize(plain, maxDimension) is { } dds) results[i] = TextureOptimizer.Pack(dds);
+                        if (TextureOptimizer.TryOptimize(plain, maxDimension) is { } dds) results[i] = TextureOptimizer.Pack(dds, c.IsCompressed);
                     }
                     catch
                     {
@@ -1823,8 +1864,12 @@ public class VaultService
             }
         }
 
+        // The index rules (crashing packages, manifests, one copy of each resource) live in GetIndexedChunksAsync.
+        var loadableChunkIds = (await GetIndexedChunksAsync(shard.Id, scope)).Select(e => e.ChunkId).ToHashSet();
+
         bool IsIndexed(VaultChunkEntry e) =>
             enabledMetaIds.Contains(e.MetaEntityId) && !turnedOffChunkIds.Contains(Math.Abs(e.ChunkId))
+            && loadableChunkIds.Contains(Math.Abs(e.ChunkId))
             && (e.ChunkId > 0 ? !indexOptimized.Contains(e.ChunkId) : indexOptimized.Contains(-e.ChunkId));
 
         // Phase marker: HeaderIndexOffset is only set to the new file's index offset once the new

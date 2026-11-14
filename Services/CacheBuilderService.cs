@@ -20,11 +20,26 @@ namespace PlumbobForge.Backend.Services;
 
 public class CacheBuilderService
 {
-    private static readonly TGI_Key DollDressedKey = new(832458525u, 0u, 4064452635095512314uL);
     private static readonly byte[] ColonSpaceBytes = [(byte)':', (byte)' '];
     private static readonly HashSet<char> InvalidFileNameChars = [.. Path.GetInvalidFileNameChars()];
     private static readonly HashSet<char> InvalidCacheFolderChars = [.. Path.GetInvalidFileNameChars(), '/', '\\'];
     private const long MaxBundleSize = 1024L * 1024L * 1024L; // 1 GB bundle limit
+
+    private const int CacheLayoutVersion = 2;
+    private const string CacheLayoutFile = "CacheLayout.txt";
+
+    private static bool HasCurrentLayout(string cacheDir)
+    {
+        try
+        {
+            string path = Path.Combine(cacheDir, CacheLayoutFile);
+            return File.Exists(path) && File.ReadAllText(path).Trim() == CacheLayoutVersion.ToString();
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     // Lots, Sims, worlds and patterns are exported to files; sets rebuilt in parallel must not write them at the same time.
     private static readonly object NonPackageExportLock = new();
@@ -34,8 +49,7 @@ public class CacheBuilderService
         None,
         World,
         Lot,
-        Sim,
-        Pattern
+        Sim
     }
 
     private static SpecialPackageType DetectSpecialPackageType(DBPFPackage package)
@@ -46,7 +60,6 @@ public class CacheBuilderService
             if (t == 107542056) return SpecialPackageType.World;
             if (t == 3496170587u) return SpecialPackageType.Lot;
             if (t == 83396964) return SpecialPackageType.Sim;
-            if (t == 0xD4D9FBE5) return SpecialPackageType.Pattern;
         }
         return SpecialPackageType.None;
     }
@@ -157,7 +170,8 @@ public class CacheBuilderService
                     }
                 }
 
-                bool staticCacheExists = Directory.Exists(staticCacheDir) && Directory.GetFiles(staticCacheDir, "StaticBundle*.package").Length > 0;
+                bool staticCacheExists = Directory.Exists(staticCacheDir) && Directory.GetFiles(staticCacheDir, "StaticBundle*.package").Length > 0
+                    && HasCurrentLayout(staticCacheDir);
                 if (forceRebuildStatic || !staticCacheExists)
                 {
                     await RebuildStaticCacheAsync(onProgress);
@@ -424,7 +438,6 @@ public class CacheBuilderService
         }
     }
 
-    private async Task<List<(string Dest, string Source)>> GetVaultModeLibraryDeploymentsAsync(ConfigEntity? activeConfig)
     private async Task<List<(string Dest, string Source)>> GetVaultModeLibraryDeploymentsAsync(ConfigurationScope scope)
     {
         var result = new List<(string, string)>();
@@ -539,7 +552,15 @@ public class CacheBuilderService
         foreach (var set in allSets.OrderBy(s => s.Id))
         {
             string setPath = GetSetPath(set);
-            if (Directory.Exists(setPath)) continue;
+            if (Directory.Exists(setPath))
+            {
+                if (!set.Dirty && !HasCurrentLayout(setPath) && (set.MetaEntities?.Any(m => m.Enabled) ?? false))
+                {
+                    set.Dirty = true;
+                    dirtied = true;
+                }
+                continue;
+            }
 
             // Two sets could share one old folder (names that sanitize the same); only the first may take it over.
             string legacyPath = GetSetCachePath(GetLegacySetFolderName(set, allSetsMap));
@@ -590,7 +611,7 @@ public class CacheBuilderService
         var allSets = await _db.SetsEntities.Include(s => s.MetaEntities).ToListAsync();
         // A set whose cache folder is gone (deleted by hand, or never built) is rebuilt even if it looks clean.
         var setsToRebuild = allSets
-            .Where(s => forceRebuild || s.Dirty || ((s.MetaEntities?.Any(m => m.Enabled) ?? false) && !Directory.Exists(GetSetPath(s))))
+            .Where(s => forceRebuild || s.Dirty || ((s.MetaEntities?.Any(m => m.Enabled) ?? false) && !HasCurrentLayout(GetSetPath(s))))
             .ToList();
         int total = setsToRebuild.Count;
         int current = 0;
@@ -1054,7 +1075,7 @@ public class CacheBuilderService
 
         string hash = SetDirtyTracker.ComputeContentHash(ConfigItemsFolderName, items);
         string hashFile = Path.Combine(path, ConfigItemsHashFile);
-        if (!force && File.Exists(hashFile) && string.Equals(File.ReadAllText(hashFile).Trim(), hash, StringComparison.Ordinal))
+        if (!force && File.Exists(hashFile) && string.Equals(File.ReadAllText(hashFile).Trim(), hash, StringComparison.Ordinal) && HasCurrentLayout(path))
         {
             return false;
         }
@@ -1099,7 +1120,6 @@ public class CacheBuilderService
         public List<(string FileName, string Reason)>? SkippedFiles { get; }
         public Action<string>? OnProgress { get; }
         public HashSet<string> NonPackageItems { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public HashSet<string> PatternFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
         public ConcurrentBag<(MetaEntity Entity, string FallbackPath)> FallbackUpdates { get; } = new();
         public IReadOnlyDictionary<long, HashSet<TGI_Key>> DisabledObjects { get; init; } = new Dictionary<long, HashSet<TGI_Key>>();
     }
@@ -1251,9 +1271,6 @@ public class CacheBuilderService
                     case SpecialPackageType.Sim:
                         lock (NonPackageExportLock) ctx.NonPackageItems.Add(ExportNonPackage(package, "Sims", originalName, ".sim", ctx.NonPackageItems));
                         break;
-                    case SpecialPackageType.Pattern:
-                        lock (NonPackageExportLock) ctx.PatternFiles.Add(InstallAsPattern(package, originalName, ctx.OutputDir, ctx.PatternFiles));
-                        break;
                     default:
                         if (ValidatePackage(package))
                         {
@@ -1307,11 +1324,12 @@ public class CacheBuilderService
 
             foreach (string path in Directory.GetFiles(ctx.OutputDir, "Pattern_*.package"))
             {
-                if (ctx.PatternFiles.Contains(path)) continue;
                 try { File.Delete(path); } catch { }
             }
         }
         catch { }
+
+        try { File.WriteAllText(Path.Combine(ctx.OutputDir, CacheLayoutFile), CacheLayoutVersion.ToString()); } catch { }
 
         string nonPackageFile = Path.Combine(ctx.OutputDir, "NonPackageItems.txt");
         if (ctx.NonPackageItems.Count > 0)
@@ -1360,7 +1378,7 @@ public class CacheBuilderService
         try
         {
             byte[] raw = resource.ReadRaw();
-            var optimized = textureCache.GetOrCreate(raw, () => resource.IsCompressed ? resource.Read() : raw);
+            var optimized = textureCache.GetOrCreate(raw, resource.IsCompressed, () => resource.IsCompressed ? resource.Read() : raw);
             if (optimized == null) return null;
             return new ResourceEntry(new MemoryStream(optimized.Chunk, writable: false), resource.Key, 0, optimized.Chunk.Length,
                 optimized.ResourceLength, optimized.IsCompressed, resource.IsEncrypted);
@@ -1389,7 +1407,7 @@ public class CacheBuilderService
                 if (outputPkg == null)
                 {
                     string path = Path.Combine(targetDirectory, $"{bundlePrefix}{packageCount++}.new");
-                    outputPkg = new DBPFPackageBuilder(path, false, catalogFirstLayout: true);
+                    outputPkg = new DBPFPackageBuilder(path, false);
                 }
 
                 outputPkg.AddResource(resource);
@@ -1533,24 +1551,6 @@ public class CacheBuilderService
         return path;
     }
 
-    private static string InstallAsPattern(DBPFPackage package, string defaultName, string outputDir, ISet<string> claimed)
-    {
-        string name = SanitizeFileName(defaultName);
-        if (string.IsNullOrWhiteSpace(name)) name = "Pattern";
-        Directory.CreateDirectory(outputDir);
-
-        string path = Path.Combine(outputDir, $"Pattern_{name}.package");
-        int count = 1;
-        while (claimed.Contains(path))
-        {
-            path = Path.Combine(outputDir, $"Pattern_{name}_{count}.package");
-            count++;
-        }
-
-        package.Export(path);
-        return path;
-    }
-
     private static string SanitizeFileName(string name)
     {
         if (string.IsNullOrEmpty(name)) return string.Empty;
@@ -1566,17 +1566,13 @@ public class CacheBuilderService
         return buffer != null ? new string(buffer) : name;
     }
 
-    private bool ValidateResource(TGI_Key key)
-    {
-        if (key.Type == 1944665835) return false;
-        return true;
-    }
+    private static bool ValidateResource(TGI_Key key) => CacheContentRules.IsLoadableType(key.Type);
 
-    private bool ValidatePackage(DBPFPackage package)
+    private static bool ValidatePackage(DBPFPackage package)
     {
         foreach (var resource in package.Resources)
         {
-            if (resource.Key.Equals(DollDressedKey)) return false;
+            if (resource.Key.Equals(CacheContentRules.CrashingObjectKey)) return false;
         }
         return true;
     }

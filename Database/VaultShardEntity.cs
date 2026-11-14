@@ -25,6 +25,8 @@ public class VaultShardEntity
 
     public int ResourceCount { get; set; }
 
+    public string? IndexScope { get; set; }
+
     public ICollection<VaultChunkEntity> Chunks { get; set; } = new List<VaultChunkEntity>();
     public ICollection<VaultHoleEntity> Holes { get; set; } = new List<VaultHoleEntity>();
 }
