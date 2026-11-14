@@ -1145,7 +1145,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
 
         const int targetSize = 128;
         var imageInfo = new SkiaSharp.SKImageInfo(targetSize, targetSize, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Premul);
-        using var resizedBitmap = originalBitmap.Resize(imageInfo, SkiaSharp.SKFilterQuality.High);
+        using var resizedBitmap = originalBitmap.Resize(imageInfo, new SkiaSharp.SKSamplingOptions(SkiaSharp.SKCubicResampler.Mitchell));
         using var skImage = SkiaSharp.SKImage.FromBitmap(resizedBitmap ?? originalBitmap);
         using var encodedData = skImage.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
         byte[] pngBytes = encodedData.ToArray();

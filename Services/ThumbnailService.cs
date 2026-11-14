@@ -388,8 +388,8 @@ public class ThumbnailService
                 using var surface = SKSurface.Create(info);
                 if (surface != null)
                 {
-                    using var paint = new SKPaint { FilterQuality = SKFilterQuality.Medium };
-                    surface.Canvas.DrawBitmap(original, new SKRect(0, 0, targetWidth, targetHeight), paint);
+                    using var originalImage = SKImage.FromBitmap(original);
+                    surface.Canvas.DrawImage(originalImage, new SKRect(0, 0, targetWidth, targetHeight), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
                     using var image = surface.Snapshot();
                     using var encoded = image.Encode(SKEncodedImageFormat.Jpeg, 82);
                     if (encoded != null)

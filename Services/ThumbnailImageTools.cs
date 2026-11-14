@@ -39,9 +39,10 @@ public static class ThumbnailImageTools
         using var surface = SKSurface.Create(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul))
             ?? throw new InvalidOperationException("Could not create an image surface");
         surface.Canvas.Clear(SKColors.Transparent);
-        using (var paint = new SKPaint { FilterQuality = SKFilterQuality.High, IsAntialias = true })
+        using (var originalImage = SKImage.FromBitmap(original))
+        using (var paint = new SKPaint { IsAntialias = true })
         {
-            surface.Canvas.DrawBitmap(original, dest, paint);
+            surface.Canvas.DrawImage(originalImage, dest, new SKSamplingOptions(SKCubicResampler.Mitchell), paint);
         }
         using var image = surface.Snapshot();
         using var encoded = image.Encode(SKEncodedImageFormat.Png, 100) ?? throw new InvalidOperationException("Could not encode the thumbnail");

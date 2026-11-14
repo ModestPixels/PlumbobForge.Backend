@@ -17,6 +17,8 @@ public static class CacheContentRules
     public static bool IsLoadableType(uint type) => type != ManifestType;
 }
 
+// Pattern resources whose reskeys read "key:TTTTTTTT:GGGGGGGG: IIII": the space before the instance keeps the game
+// from finding the texture ("Materializing Materials"). Used by the Pattern Fixer and by vault imports.
 public static class PatternKeyRepair
 {
     private static readonly Regex BrokenKeyRegex = new(
