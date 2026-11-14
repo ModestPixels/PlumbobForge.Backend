@@ -27,7 +27,7 @@ public class PlumbobForgeOptions
     public bool EnableSingleSourceVault { get; set; } = false;
     public bool AutoRebuildStaticCache { get; set; } = false;
     public bool EnableAutoScan { get; set; } = true;
-    public bool AutoClearGameCaches { get; set; } = true;
+    public bool AutoClearGameCaches { get; set; } = false;
     public bool OptimizeTextures { get; set; } = false;
     public int TextureMaxDimension { get; set; } = 2048;
     public System.Collections.Generic.List<string> ObservedFolders { get; set; } = new();
