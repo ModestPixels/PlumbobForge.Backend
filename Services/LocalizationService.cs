@@ -9,7 +9,7 @@ using PlumbobForge.Backend.Configuration;
 
 namespace PlumbobForge.Backend.Services;
 
-public class LocalizationService
+public class LocalizationService : IDisposable
 {
     private static Func<string, object[]?, string>? _externalProvider;
 
@@ -19,6 +19,7 @@ public class LocalizationService
     }
 
     private readonly IOptionsMonitor<PlumbobForgeOptions> _options;
+    private readonly IDisposable? _optionsSubscription;
     private readonly Dictionary<string, string> _strings = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _fallbackStrings = new(StringComparer.OrdinalIgnoreCase);
 
@@ -26,7 +27,12 @@ public class LocalizationService
     {
         _options = options;
         LoadStrings();
-        _options.OnChange(_ => LoadStrings());
+        _optionsSubscription = _options.OnChange(_ => LoadStrings());
+    }
+
+    public void Dispose()
+    {
+        _optionsSubscription?.Dispose();
     }
 
     public string GetCurrentLanguage()

@@ -26,7 +26,10 @@ public class NotificationService
         var json = JsonSerializer.Serialize(new { eventName, data });
         var payload = $"data: {json}\n\n";
 
-        foreach (var subscriber in _subscribers.Values)
+        var subscribers = _subscribers.Values.ToList();
+        if (subscribers.Count == 0) return;
+
+        var tasks = subscribers.Select(async subscriber =>
         {
             try
             {
@@ -36,6 +39,8 @@ public class NotificationService
             {
                 // Ignore disconnected subscribers
             }
-        }
+        });
+
+        await Task.WhenAll(tasks);
     }
 }
