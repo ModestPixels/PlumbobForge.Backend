@@ -134,8 +134,7 @@ public static class AppLogger
         try
         {
             var appDataJson = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "plumbobforge-app",
+                PlumbobForge.Backend.Configuration.AppPaths.AppDataDir,
                 "appsettings.json");
 
             if (File.Exists(appDataJson))
