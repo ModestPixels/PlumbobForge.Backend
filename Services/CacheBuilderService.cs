@@ -901,14 +901,23 @@ public class CacheBuilderService
         }
         catch { }
 
-        // Update CachedHash and reset Dirty flag for all sets in database
-        var allSets = await _db.SetsEntities.Include(s => s.MetaEntities).ToListAsync();
+        await _db.SaveChangesAsync();
+
+        // The bundle holds every set now: store each set's hash and clear its Dirty flag. This context may have loaded the
+        // sets long ago while other contexts marked them dirty since, so read them untracked and write straight to the
+        // database; changing stale tracked rows would save nothing and leave the rebuild prompt on.
+        var allSets = await _db.SetsEntities.AsNoTracking().Include(s => s.MetaEntities).ToListAsync();
         foreach (var set in allSets)
         {
-            set.CachedHash = SetDirtyTracker.ComputeContentHash(set);
-            set.Dirty = false;
+            string hash = SetDirtyTracker.ComputeContentHash(set);
+            await _db.SetsEntities.Where(s => s.Id == set.Id)
+                .ExecuteUpdateAsync(u => u.SetProperty(s => s.CachedHash, hash).SetProperty(s => s.Dirty, false));
         }
-        await _db.SaveChangesAsync();
+        // Sets this context already tracks pick up the new values, so a later save from it can't bring the flag back.
+        foreach (var tracked in _db.ChangeTracker.Entries<SetsEntity>().ToList())
+        {
+            await tracked.ReloadAsync();
+        }
 
         PruneStagedNonPackageFiles(new[] { Path.Combine(staticCacheDir, "NonPackageItems.txt") });
         OnGameContentChanged();
@@ -1487,16 +1496,54 @@ public class CacheBuilderService
 
     private void FixPTRN_XML(ResourceEntry resource) => FixResKeyColonSpace(resource, "complate");
 
+    // Mods/Resource.cfg loads our Cache/Config/Resource.cfg. "Scan" takes a folder (the game then reads that folder's
+    // Resource.cfg); pointing "PackedFile" at the .cfg file itself made the game read it over and over. Written like
+    // CCMagic does: absolute, quoted, forward slashes, trailing slash. It is rewritten on every sync and at startup, so
+    // it follows the Sims 3 folder if that moves.
+    private static string GetConfigScanLine(string sims3ModsDir)
+    {
+        string configDir = Path.GetFullPath(Path.Combine(sims3ModsDir, "Cache", "Config")).Replace('\\', '/').TrimEnd('/');
+        return $"Scan \"{configDir}/\"";
+    }
+
+    // True for any line that loads Cache/Config, however it was written: PackedFile of the .cfg, or Scan of the folder,
+    // relative or absolute (any old location), with or without quotes, a trailing slash or backslashes.
+    private static bool IsConfigCfgLine(string line)
+    {
+        string trimmed = line.Trim();
+        int space = trimmed.IndexOfAny(new[] { ' ', '\t' });
+        if (space <= 0) return false;
+        string keyword = trimmed[..space];
+        if (!keyword.Equals("PackedFile", StringComparison.OrdinalIgnoreCase) &&
+            !keyword.Equals("Scan", StringComparison.OrdinalIgnoreCase)) return false;
+        string path = trimmed[space..].Trim().Trim('"').Replace('\\', '/').TrimEnd('/');
+        if (path.EndsWith("/Resource.cfg", StringComparison.OrdinalIgnoreCase)) path = path[..^"/Resource.cfg".Length];
+        return path.Equals("Cache/Config", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith("/Mods/Cache/Config", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Startup: brings an existing Mods/Resource.cfg up to date (old PackedFile line). Never creates one; syncing does.
+    public void UpgradeMainResourceCfg()
+    {
+        try
+        {
+            string modsDir = Path.Combine(GetSims3FolderPath(), "Mods");
+            if (File.Exists(Path.Combine(modsDir, "Resource.cfg"))) EnsureMainResourceCfg(modsDir);
+        }
+        catch { }
+    }
+
     private void EnsureMainResourceCfg(string sims3ModsDir)
     {
         string mainResourceCfg = Path.Combine(sims3ModsDir, "Resource.cfg");
+        string configScanLine = GetConfigScanLine(sims3ModsDir);
         if (!File.Exists(mainResourceCfg))
         {
             try
             {
                 using var sw = new StreamWriter(mainResourceCfg, false);
                 sw.WriteLine("Priority 500");
-                sw.WriteLine("PackedFile Cache/Config/Resource.cfg");
+                sw.WriteLine(configScanLine);
                 sw.WriteLine("PackedFile Packages/*.package");
                 sw.WriteLine("PackedFile Packages/*/*.package");
                 sw.WriteLine("PackedFile Packages/*/*/*.package");
@@ -1517,38 +1564,27 @@ public class CacheBuilderService
             {
                 string content = File.ReadAllText(mainResourceCfg);
                 var lines = content.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None).ToList();
-                bool modified = false;
+                if (lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
 
-                // Remove invalid relative Scan "Cache/Config/" if previously inserted
-                for (int i = lines.Count - 1; i >= 0; i--)
+                // Exactly one Scan of Cache/Config, where the first old or new form of the line was. The old
+                // "PackedFile Cache/Config/Resource.cfg", relative Scans, other paths and duplicates go.
+                var matches = Enumerable.Range(0, lines.Count).Where(i => IsConfigCfgLine(lines[i])).ToList();
+                bool upToDate = matches.Count == 1 && lines[matches[0]].Trim() == configScanLine;
+                if (!upToDate)
                 {
-                    string trimmed = lines[i].Trim();
-                    if (trimmed.Equals("Scan \"Cache/Config/\"", StringComparison.OrdinalIgnoreCase) ||
-                        trimmed.Equals("Scan Cache/Config/", StringComparison.OrdinalIgnoreCase))
+                    int insertIndex;
+                    if (matches.Count > 0)
                     {
-                        lines.RemoveAt(i);
-                        modified = true;
+                        insertIndex = matches[0];
+                        for (int k = matches.Count - 1; k >= 0; k--) lines.RemoveAt(matches[k]);
                     }
-                }
-
-                // Ensure PackedFile Cache/Config/Resource.cfg is present
-                if (!lines.Any(l => l.Trim().Contains("Cache/Config/Resource.cfg", StringComparison.OrdinalIgnoreCase)))
-                {
-                    int insertIndex = 0;
-                    for (int i = 0; i < lines.Count; i++)
+                    else
                     {
-                        if (lines[i].TrimStart().StartsWith("Priority", StringComparison.OrdinalIgnoreCase))
-                        {
-                            insertIndex = i + 1;
-                            break;
-                        }
+                        // Right after the first Priority line, so it gets the priority our caches were written for.
+                        int priority = lines.FindIndex(l => l.TrimStart().StartsWith("Priority", StringComparison.OrdinalIgnoreCase));
+                        insertIndex = priority + 1;
                     }
-                    lines.Insert(insertIndex, "PackedFile Cache/Config/Resource.cfg");
-                    modified = true;
-                }
-
-                if (modified)
-                {
+                    lines.Insert(insertIndex, configScanLine);
                     File.WriteAllLines(mainResourceCfg, lines);
                 }
             }
