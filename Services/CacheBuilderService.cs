@@ -1497,14 +1497,8 @@ public class CacheBuilderService
     private void FixPTRN_XML(ResourceEntry resource) => FixResKeyColonSpace(resource, "complate");
 
     // Mods/Resource.cfg loads our Cache/Config/Resource.cfg. "Scan" takes a folder (the game then reads that folder's
-    // Resource.cfg); pointing "PackedFile" at the .cfg file itself made the game read it over and over. Written like
-    // CCMagic does: absolute, quoted, forward slashes, trailing slash. It is rewritten on every sync and at startup, so
-    // it follows the Sims 3 folder if that moves.
-    private static string GetConfigScanLine(string sims3ModsDir)
-    {
-        string configDir = Path.GetFullPath(Path.Combine(sims3ModsDir, "Cache", "Config")).Replace('\\', '/').TrimEnd('/');
-        return $"Scan \"{configDir}/\"";
-    }
+    // Resource.cfg); pointing "PackedFile" at the .cfg file itself made the game read it over and over. Keep it relative:
+    private const string ConfigScanLine = "Scan Cache/Config";
 
     // True for any line that loads Cache/Config, however it was written: PackedFile of the .cfg, or Scan of the folder,
     // relative or absolute (any old location), with or without quotes, a trailing slash or backslashes.
@@ -1536,7 +1530,7 @@ public class CacheBuilderService
     private void EnsureMainResourceCfg(string sims3ModsDir)
     {
         string mainResourceCfg = Path.Combine(sims3ModsDir, "Resource.cfg");
-        string configScanLine = GetConfigScanLine(sims3ModsDir);
+        string configScanLine = ConfigScanLine;
         if (!File.Exists(mainResourceCfg))
         {
             try
@@ -1567,7 +1561,7 @@ public class CacheBuilderService
                 if (lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
 
                 // Exactly one Scan of Cache/Config, where the first old or new form of the line was. The old
-                // "PackedFile Cache/Config/Resource.cfg", relative Scans, other paths and duplicates go.
+                // "PackedFile Cache/Config/Resource.cfg", absolute Scans of the folder and duplicates go.
                 var matches = Enumerable.Range(0, lines.Count).Where(i => IsConfigCfgLine(lines[i])).ToList();
                 bool upToDate = matches.Count == 1 && lines[matches[0]].Trim() == configScanLine;
                 if (!upToDate)
