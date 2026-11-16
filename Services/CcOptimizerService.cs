@@ -52,6 +52,18 @@ public sealed class CcAnalysis
 {
     public required IReadOnlyList<CcMesh> Meshes { get; init; }
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
+    // The CAS part whose presets colour the preview (the first one in the package, as in the web tool).
+    public InspectedResource? Casp { get; init; }
+
+    public List<CasPreset> ReadPresets(PackageInspection inspection)
+    {
+        if (Casp == null) return new List<CasPreset>();
+        try { return CasPreset.ReadAll(inspection.Read(Casp)); }
+        catch (Exception) { return new List<CasPreset>(); }
+    }
+
+    // Meshes of the first level of detail, which decide whether a texture's alpha is used as a cut-out.
+    public IEnumerable<GeomMesh> TopMeshes => Lods.Count == 0 ? Enumerable.Empty<GeomMesh>() : MeshesIn(Lods[0]).Select(m => m.Geom);
 
     public IReadOnlyList<int> Lods => Meshes.Select(m => m.Lod).Distinct().ToList();
 
@@ -139,6 +151,7 @@ public sealed record CcOptimizeResult(IReadOnlyList<CcMeshChange> Changes)
 public class CcOptimizerService
 {
     private const uint Vpxy = 0x736884F1u;
+    private const uint Casp = 0x034AEECBu;
 
     private readonly AppDbContext _db;
     private readonly PackageInspectorService _inspector;
@@ -209,7 +222,8 @@ public class CcOptimizerService
             .OrderBy(m => m.Lod == CcMesh.Unlisted ? 99 : m.Lod)
             .ThenBy(m => m.Slot)
             .ToList();
-        return new CcAnalysis { Meshes = ordered, Warnings = warnings };
+        var casp = inspection.Resources.FirstOrDefault(r => r.Key.Type == Casp);
+        return new CcAnalysis { Meshes = ordered, Warnings = warnings, Casp = casp };
     }
 
     // The replaced meshes, grouped the way PackageEditService.ApplyAsync takes them.
