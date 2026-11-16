@@ -10,24 +10,30 @@ using S3ForgeTools.GameFiles.Package;
 
 namespace PlumbobForge.Backend.Services;
 
-// One GEOM in a package and the level of detail its VPXY puts it in.
+// One GEOM mesh and its level of detail.
 public sealed class CcMesh
 {
     public const int Unlisted = -1;
 
     public required InspectedResource Resource { get; init; }
     public required GeomMesh Geom { get; init; }
-    // Level of detail (0 = most detailed), or Unlisted when no VPXY in its part lists it.
+    // 0 = most detailed; Unlisted when no VPXY lists it.
     public int Lod { get; init; }
-    // Position within its LOD entry.
     public int Slot { get; init; }
-    // Saving keeps a single copy of a key, so a mesh whose key appears twice is never changed.
+    // Duplicate keys can't be saved safely, so they are never changed.
     public bool HasDuplicateKey { get; init; }
+    // Objects: index of the mesh in its MLOD resource.
+    public int? ObjectMeshIndex { get; init; }
+    // Objects: the diffuse texture, when it is in the package.
+    public InspectedResource? Diffuse { get; init; }
+    // Triangle count saved in the package, when working from a backup.
+    public int? StoredTriangles { get; internal set; }
 
     public TGI_Key Key => Resource.Key;
     public int Triangles => Geom.Triangles;
+    public int TrianglesNow => StoredTriangles ?? Triangles;
     public int Vertices => Geom.VertexCount;
-    // One- or two-triangle dummy meshes that converters leave in; never reduced.
+    // Tiny dummy meshes left by converters; never reduced.
     public bool IsPlaceholder => Triangles <= 2;
     public bool CanReduce => !IsPlaceholder && !HasDuplicateKey;
 
@@ -37,7 +43,7 @@ public sealed class CcMesh
     public CcMeshSimplifier.Layers Layers => _layers ??= CcMeshSimplifier.AnalyzeLayers(Geom);
     public bool IsDoubleSided => Layers.DoubleSided;
 
-    // The mesh reduced to ratio; the last result is remembered so live previews stay cheap.
+    // The last result is cached for the live preview.
     public CcSimplifyResult Reduce(double ratio, bool lockEdges)
     {
         if (!CanReduce || ratio >= 0.999) return new CcSimplifyResult(Geom, Triangles, Vertices, _layers?.DoubleSided ?? false);
@@ -52,22 +58,63 @@ public sealed class CcAnalysis
 {
     public required IReadOnlyList<CcMesh> Meshes { get; init; }
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
-    // The CAS part whose presets colour the preview (the first one in the package, as in the web tool).
+    public bool IsObject { get; init; }
+    // The CAS part whose presets colour the preview.
     public InspectedResource? Casp { get; init; }
 
     public List<CasPreset> ReadPresets(PackageInspection inspection)
     {
         if (Casp == null) return new List<CasPreset>();
-        try { return CasPreset.ReadAll(inspection.Read(Casp)); }
+        var own = TryReadPresets(inspection, Casp);
+        if (own.Count > 0) return own;
+
+        // Parts with no presets borrow them from a part with the same meshes, or (hair) from another hair.
+        HashSet<TGI_Key> mine;
+        try { mine = MeshStatsReader.ReadCaspTable(inspection.Read(Casp)).Where(IsMeshKey).ToHashSet(); }
+        catch (Exception) { return own; }
+        var others = inspection.Resources.Where(r => r.Key.Type == Casp.Key.Type && r != Casp).ToList();
+        foreach (var other in others)
+        {
+            try
+            {
+                if (!MeshStatsReader.ReadCaspTable(inspection.Read(other)).Any(k => IsMeshKey(k) && mine.Contains(k))) continue;
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+            var borrowed = TryReadPresets(inspection, other);
+            if (borrowed.Count > 0) return borrowed;
+        }
+
+        var hairMesh = Lods.Count == 0 ? null : MeshesIn(Lods[0]).Select(m => m.Geom).FirstOrDefault(g => g.IsHairShader);
+        if (hairMesh == null || !hairMesh.MaterialTextures().TryGetValue(DiffuseMapParam, out var diffuse)) return own;
+        if (!inspection.Resources.Any(r => r.Key.Type == CcMaterial.TextureType && r.Key.Instance == diffuse.Instance)) return own;
+        foreach (var other in others)
+        {
+            var hair = TryReadPresets(inspection, other).Where(p => p.IsHair).ToList();
+            if (hair.Count == 0) continue;
+            string value = $"key:{CcMaterial.TextureType:X8}:{diffuse.Group:X8}:{diffuse.Instance:X16}";
+            return hair.Select(p => p with { Values = new Dictionary<string, string>(p.Values) { ["Diffuse Map"] = value } }).ToList();
+        }
+        return own;
+    }
+
+    private const uint DiffuseMapParam = 0x6CC0FD85u;
+
+    private static bool IsMeshKey(TGI_Key k) => k.Type == 0x736884F1u || k.Type == GeomMesh.ResourceType;
+
+    private static List<CasPreset> TryReadPresets(PackageInspection inspection, InspectedResource casp)
+    {
+        try { return CasPreset.ReadAll(inspection.Read(casp)); }
         catch (Exception) { return new List<CasPreset>(); }
     }
 
-    // Meshes of the first level of detail, which decide whether a texture's alpha is used as a cut-out.
     public IEnumerable<GeomMesh> TopMeshes => Lods.Count == 0 ? Enumerable.Empty<GeomMesh>() : MeshesIn(Lods[0]).Select(m => m.Geom);
 
     public IReadOnlyList<int> Lods => Meshes.Select(m => m.Lod).Distinct().ToList();
 
-    // The two most detailed levels; lower ones are tiny and saved as they are.
+    // The top two levels; lower ones are left alone.
     public IReadOnlyList<int> EditableLods
     {
         get
@@ -81,11 +128,24 @@ public sealed class CcAnalysis
     public IEnumerable<CcMesh> MeshesIn(int lod) => Meshes.Where(m => m.Lod == lod);
     public int TrianglesIn(int lod) => MeshesIn(lod).Sum(m => m.Triangles);
     public int RealTrianglesIn(int lod) => MeshesIn(lod).Where(m => !m.IsPlaceholder).Sum(m => m.Triangles);
+    public int RealTrianglesNowIn(int lod) => MeshesIn(lod).Where(m => !m.IsPlaceholder).Sum(m => m.TrianglesNow);
 
-    // Clothing has vertex IDs (for morphs) and open edges that meet the body, so those are locked by default.
-    public bool SuggestLockEdges => Meshes.Any(m => m.Geom.HasVertexIds);
+    // Built from backed-up originals.
+    public bool IsFromOriginals => Meshes.Any(m => m.StoredTriangles != null);
 
-    // Converters often copy the top level into the second one; suggest linking when they are about the same.
+    // The ratio the package is at now, for the slider.
+    public double StoredRatioFor(int lod)
+    {
+        int original = RealTrianglesIn(lod);
+        if (original <= 0) return 1;
+        double r = Math.Round((double)RealTrianglesNowIn(lod) / original, 2);
+        return r >= 0.995 ? 1 : Math.Clamp(r, 0.05, 1);
+    }
+
+    // Clothing and objects keep their open edges by default.
+    public bool SuggestLockEdges => IsObject || Meshes.Any(m => m.Geom.HasVertexIds);
+
+    // Converters often copy the top level into the second one.
     public bool SuggestLinkSecondLod
     {
         get
@@ -96,12 +156,11 @@ public sealed class CcAnalysis
     }
 }
 
-// What to keep of each level of detail.
 public sealed class CcOptimizePlan
 {
-    // Fraction of triangles to keep per LOD (missing = 1, untouched).
+    // Fraction of triangles to keep per level (missing = 1).
     public Dictionary<int, double> Ratios { get; } = new();
-    // Reduce the second level to half of what the first one ends up with.
+    // Second level becomes half of the first.
     public bool LinkSecondLod { get; set; }
     public bool LockEdges { get; set; } = true;
 
@@ -145,13 +204,16 @@ public sealed record CcOptimizeResult(IReadOnlyList<CcMeshChange> Changes)
     public int TrianglesAfter => Changes.Sum(c => c.After);
 }
 
-// The CC optimizer: lowers the polygon count of CAS part meshes (typically TS4 conversions) per level of detail.
-// Only GEOM resources are replaced; CAS parts, textures, morphs and bones are left untouched. Ported from the
-// web CC optimizer (cc.js / export.js).
+// Lowers the triangle count of CC meshes. Ported from the web CC optimizer.
 public class CcOptimizerService
 {
     private const uint Vpxy = 0x736884F1u;
     private const uint Casp = 0x034AEECBu;
+    private const uint Objd = 0x319E4F1Du;
+    private const uint Mlod = 0x01D10F34u;
+
+    // All objects of a package at once (colour variants share meshes).
+    public static readonly TGI_Key AllObjects = new(Objd, uint.MaxValue, ulong.MaxValue);
 
     private readonly AppDbContext _db;
     private readonly PackageInspectorService _inspector;
@@ -166,13 +228,100 @@ public class CcOptimizerService
         _cacheBuilder = cacheBuilder;
     }
 
-    public static CcAnalysis Analyse(PackageInspection inspection, CancellationToken ct = default)
+    // casPart: one CAS part or OBJD; null for the whole package.
+    public static CcAnalysis Analyse(PackageInspection inspection, TGI_Key? casPart = null, CancellationToken ct = default)
     {
+        var analysis = AnalyseCore(inspection, casPart, ct);
+        if (inspection.Originals.Count > 0) MeasureStored(inspection, analysis);
+        return analysis;
+    }
+
+    private static void MeasureStored(PackageInspection inspection, CcAnalysis analysis)
+    {
+        foreach (var group in analysis.Meshes.Where(m => inspection.Originals.ContainsKey(m.Resource)).GroupBy(m => m.Resource))
+        {
+            try
+            {
+                var stored = inspection.ReadStored(group.Key);
+                if (group.First().ObjectMeshIndex == null)
+                {
+                    int triangles = GeomMesh.Read(stored).Triangles;
+                    foreach (var m in group) m.StoredTriangles = triangles;
+                }
+                else
+                {
+                    var model = MlodModel.Read(stored);
+                    foreach (var m in group)
+                    {
+                        if (m.ObjectMeshIndex is int i && i < model.Meshes.Count) m.StoredTriangles = model.RealTriangles(i);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+    }
+
+    private static CcAnalysis AnalyseCore(PackageInspection inspection, TGI_Key? casPart, CancellationToken ct)
+    {
+        if (casPart?.Type == Objd || (casPart == null
+            && !inspection.Resources.Any(r => r.Key.Type == GeomMesh.ResourceType)
+            && inspection.Resources.Any(r => r.Key.Type == Objd)))
+        {
+            return AnalyseObject(inspection, casPart == AllObjects ? null : casPart, ct);
+        }
+
         var warnings = new List<string>();
 
-        // LOD and slot of every mesh, from the VPXY resources of the same part. Meshes are matched by instance.
+        var casp = casPart is { } wantedPart
+            ? inspection.Resources.FirstOrDefault(r => r.Key == wantedPart)
+            : inspection.Resources.FirstOrDefault(r => r.Key.Type == Casp);
+
+        // With a CAS part given, only its own meshes count.
+        HashSet<TGI_Key>? ownVpxy = null;
+        HashSet<ulong>? ownGeoms = null;
+        HashSet<uint>? ownGroups = null;
+        if (casPart != null && casp != null)
+        {
+            try
+            {
+                var table = MeshStatsReader.ReadCaspTable(inspection.Read(casp));
+                ownVpxy = table.Where(k => k.Type == Vpxy).ToHashSet();
+                ownGeoms = table.Where(k => k.Type == GeomMesh.ResourceType).Select(k => k.Instance).ToHashSet();
+            }
+            catch (Exception ex)
+            {
+                warnings.Add($"Could not read the CAS part {casp.Key}: {ex.Message}");
+            }
+        }
+        var vpxyResources = inspection.Resources.Where(r => r.Key.Type == Vpxy).ToList();
+        if (ownVpxy != null && vpxyResources.Any(r => ownVpxy.Contains(r.Key)))
+        {
+            vpxyResources = vpxyResources.Where(r => ownVpxy.Contains(r.Key)).ToList();
+        }
+        else if (ownVpxy is { Count: > 0 } && ownGeoms != null)
+        {
+            // Replacement meshes: matched by group = VPXY instance.
+            var groups = ownVpxy.Select(k => (uint)k.Instance).ToHashSet();
+            if (inspection.Resources.Any(r => r.Key.Type == GeomMesh.ResourceType && groups.Contains(r.Key.Group)))
+            {
+                ownGroups = groups;
+                ownGeoms = null;
+                vpxyResources = [];
+            }
+            else
+            {
+                ownGeoms = null;
+            }
+        }
+        else
+        {
+            ownGeoms = null;
+        }
+
         var lodOf = new Dictionary<(int Part, ulong Instance), (int Lod, int Slot)>();
-        foreach (var res in inspection.Resources.Where(r => r.Key.Type == Vpxy))
+        foreach (var res in vpxyResources)
         {
             ct.ThrowIfCancellationRequested();
             try
@@ -181,7 +330,9 @@ public class CcOptimizerService
                 {
                     for (int slot = 0; slot < keys.Count; slot++)
                     {
-                        if (keys[slot].Type == GeomMesh.ResourceType) lodOf[(res.PartIndex, keys[slot].Instance)] = (lod, slot);
+                        if (keys[slot].Type != GeomMesh.ResourceType) continue;
+                        lodOf[(res.PartIndex, keys[slot].Instance)] = (lod, slot);
+                        ownGeoms?.Add(keys[slot].Instance);
                     }
                 }
             }
@@ -199,6 +350,8 @@ public class CcOptimizerService
         foreach (var res in inspection.Resources.Where(r => r.Key.Type == GeomMesh.ResourceType))
         {
             ct.ThrowIfCancellationRequested();
+            if (ownGeoms != null && !ownGeoms.Contains(res.Key.Instance)) continue;
+            if (ownGroups != null && !ownGroups.Contains(res.Key.Group)) continue;
             try
             {
                 var geom = GeomMesh.Read(inspection.Read(res));
@@ -218,19 +371,159 @@ public class CcOptimizerService
             }
         }
 
+        // No VPXY to give levels: rank by size, like Mesh Report.
+        if (ownGroups != null && meshes.Count > 1 && meshes.All(m => m.Lod == CcMesh.Unlisted))
+        {
+            meshes = meshes
+                .OrderByDescending(m => m.Triangles)
+                .Select((m, i) => new CcMesh { Resource = m.Resource, Geom = m.Geom, Lod = i, Slot = 0, HasDuplicateKey = m.HasDuplicateKey })
+                .ToList();
+        }
+
         var ordered = meshes
             .OrderBy(m => m.Lod == CcMesh.Unlisted ? 99 : m.Lod)
             .ThenBy(m => m.Slot)
             .ToList();
-        var casp = inspection.Resources.FirstOrDefault(r => r.Key.Type == Casp);
         return new CcAnalysis { Meshes = ordered, Warnings = warnings, Casp = casp };
     }
 
-    // The replaced meshes, grouped the way PackageEditService.ApplyAsync takes them.
+    // Objects: OBJD -> OBJK -> MODL -> MLOD. Shadows are skipped.
+    private static CcAnalysis AnalyseObject(PackageInspection inspection, TGI_Key? objdKey, CancellationToken ct)
+    {
+        var warnings = new List<string>();
+        var objds = inspection.Resources.Where(r => r.Key.Type == Objd && (objdKey == null || r.Key == objdKey)).ToList();
+
+        InspectedResource? Find(TGI_Key key, int part) =>
+            inspection.Resources.FirstOrDefault(r => r.Key == key && r.PartIndex == part) ?? inspection.Resources.FirstOrDefault(r => r.Key == key);
+
+        // Older materials often have the wrong group, so match by type and instance too.
+        InspectedResource? FindTexture(TGI_Key? key, int part)
+        {
+            if (key is not { Type: CcMaterial.TextureType } k) return null;
+            return Find(k, part)
+                ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance && r.PartIndex == part)
+                ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance);
+        }
+
+        // -1 = the whole MLOD resource.
+        var levelOf = new Dictionary<(InspectedResource Owner, int Chunk), int>();
+        var owners = new List<InspectedResource>();
+        void Add(InspectedResource owner, int chunk, int level)
+        {
+            if (!owners.Contains(owner)) owners.Add(owner);
+            levelOf.TryAdd((owner, chunk), level);
+        }
+
+        var seenModl = new HashSet<InspectedResource>();
+        bool external = false;
+        int unreadable = 0;
+        string? firstError = null;
+        foreach (var objd in objds)
+        {
+            ct.ThrowIfCancellationRequested();
+            List<TGI_Key> modlKeys;
+            try
+            {
+                modlKeys = MeshStatsReader.ObjectModelKeys(inspection.Read(objd), k => Find(k, objd.PartIndex) is { } r ? inspection.Read(r) : null, out bool ext);
+                external |= ext;
+            }
+            catch (Exception ex)
+            {
+                unreadable++;
+                firstError ??= $"{objd.Key}: {ex.Message}";
+                continue;
+            }
+
+            foreach (var modlKey in modlKeys.Distinct())
+            {
+                var modl = Find(modlKey, objd.PartIndex);
+                if (modl == null) { external = true; continue; }
+                if (!seenModl.Add(modl)) continue;
+                try
+                {
+                    var rcol = RcolFile.Read(inspection.Read(modl));
+                    int chunk = Enumerable.Range(0, rcol.Chunks.Count).FirstOrDefault(i => rcol.TagOf(i) == "MODL", -1);
+                    if (chunk < 0) throw new InvalidDataException("No MODL chunk");
+                    foreach (var lod in ModlChunk.ReadLods(rcol.Chunks[chunk]))
+                    {
+                        if (lod.IsShadow) continue;
+                        if (rcol.ExternalKey(lod.ModelRef) is { } mlodKey)
+                        {
+                            if (mlodKey.Type != Mlod) continue;
+                            var mlod = Find(mlodKey, modl.PartIndex);
+                            if (mlod == null) { external = true; continue; }
+                            Add(mlod, -1, lod.Level);
+                        }
+                        else if (rcol.ChunkIndex(lod.ModelRef) is var inner and >= 0 && rcol.TagOf(inner) == "MLOD")
+                        {
+                            Add(modl, inner, lod.Level);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    warnings.Add($"Could not read the model {modl.Key}: {ex.Message}");
+                }
+            }
+        }
+        if (unreadable > 0) warnings.Add(unreadable == 1 ? $"Could not read the object {firstError}" : $"Could not read {unreadable} objects ({firstError})");
+        if (external) warnings.Add("Some of this object's meshes are not in the package (game meshes); only the ones inside it are listed.");
+
+        var keyCounts = inspection.Resources.GroupBy(r => (r.PartIndex, r.Key)).ToDictionary(g => g.Key, g => g.Count());
+        var meshes = new List<CcMesh>();
+        foreach (var owner in owners)
+        {
+            ct.ThrowIfCancellationRequested();
+            MlodModel model;
+            try { model = MlodModel.Read(inspection.Read(owner)); }
+            catch (Exception ex) { warnings.Add($"Mesh {owner.Key} could not be read: {ex.Message}"); continue; }
+
+            foreach (var chunk in model.Mlods.Keys.OrderBy(k => k))
+            {
+                if (!levelOf.TryGetValue((owner, -1), out int level) && !levelOf.TryGetValue((owner, chunk), out level)) continue;
+                int slot = 0;
+                foreach (int i in model.MeshesOf(chunk))
+                {
+                    if (model.Meshes[i].VrtfRef == 0) continue;
+                    if (model.WhyNotEditable(i) is { } why)
+                    {
+                        warnings.Add($"A mesh in {owner.Key} is left as it is: {why}.");
+                        continue;
+                    }
+                    try
+                    {
+                        var g = model.ReadGeometry(i);
+                        meshes.Add(new CcMesh
+                        {
+                            Resource = owner,
+                            Geom = GeomMesh.FromArrays(g.Positions, g.Normals, g.Uvs, g.Indices),
+                            Lod = level,
+                            Slot = slot++,
+                            HasDuplicateKey = keyCounts[(owner.PartIndex, owner.Key)] > 1,
+                            ObjectMeshIndex = i,
+                            Diffuse = FindTexture(model.DiffuseKey(i), owner.PartIndex),
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        warnings.Add($"A mesh in {owner.Key} could not be read: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        var ordered = meshes.OrderBy(m => m.Lod).ThenBy(m => m.Slot).ToList();
+        return new CcAnalysis { Meshes = ordered, Warnings = warnings, IsObject = true };
+    }
+
+    // From backups, reductions start from the original and 100% restores it.
     public static List<PartEdits> BuildEdits(PackageInspection inspection, CcAnalysis analysis, CcOptimizePlan plan, out CcOptimizeResult result)
     {
         var changes = new List<CcMeshChange>();
         var byPart = new Dictionary<int, List<ResourceEdit>>();
+        var written = new HashSet<InspectedResource>();
+        // Objects: each resource is written once.
+        var objectEdits = new Dictionary<InspectedResource, Dictionary<int, ObjectMeshEdit>>();
         foreach (var lod in analysis.Lods)
         {
             double ratio = plan.RatioFor(analysis, lod);
@@ -240,39 +533,118 @@ public class CcOptimizerService
                 if (!m.CanReduce) continue;
                 var r = m.Reduce(ratio, plan.LockEdges);
                 if (r.Triangles >= m.Triangles) continue;
-                int part = m.Resource.PartIndex;
-                if (!byPart.TryGetValue(part, out var list)) byPart[part] = list = new List<ResourceEdit>();
-                list.Add(new ResourceEdit(m.Key, r.Geom.Write()));
+                if (m.ObjectMeshIndex is int index)
+                {
+                    if (r.Keep == null) continue;
+                    if (!objectEdits.TryGetValue(m.Resource, out var edits)) objectEdits[m.Resource] = edits = new();
+                    edits[index] = new ObjectMeshEdit(r.Keep, r.Geom.Indices);
+                }
+                else
+                {
+                    EditsFor(m.Resource.PartIndex).Add(new ResourceEdit(m.Key, r.Geom.Write()));
+                    written.Add(m.Resource);
+                }
                 changes.Add(new CcMeshChange(m.Key, lod, m.Triangles, r.Triangles));
             }
         }
+        foreach (var (res, edits) in objectEdits)
+        {
+            var model = MlodModel.Read(inspection.Read(res));
+            EditsFor(res.PartIndex).Add(new ResourceEdit(res.Key, model.Write(edits)));
+            written.Add(res);
+        }
+        foreach (var res in analysis.Meshes.Select(m => m.Resource).Distinct())
+        {
+            if (!written.Contains(res) && inspection.Originals.TryGetValue(res, out var original))
+            {
+                EditsFor(res.PartIndex).Add(new ResourceEdit(res.Key, original));
+            }
+        }
+
+        List<ResourceEdit> EditsFor(int part)
+        {
+            if (!byPart.TryGetValue(part, out var list)) byPart[part] = list = new List<ResourceEdit>();
+            return list;
+        }
         result = new CcOptimizeResult(changes);
-        return byPart
-            .Select(p => new PartEdits(p.Key, inspection.Parts.FirstOrDefault(x => x.Index == p.Key)?.MetaEntityId, p.Value))
-            .ToList();
+        return Group(inspection, byPart);
     }
 
-    // Opens the item, reduces it with configure's plan and saves it (library files go to the Recycle Bin first).
-    public async Task<CcOptimizeResult> OptimizeAsync(long itemId, Action<CcAnalysis, CcOptimizePlan> configure, CancellationToken ct = default)
+    private static List<PartEdits> Group(PackageInspection inspection, Dictionary<int, List<ResourceEdit>> byPart) => byPart
+        .Where(p => p.Value.Count > 0)
+        .Select(p => new PartEdits(p.Key, inspection.Parts.FirstOrDefault(x => x.Index == p.Key)?.MetaEntityId, p.Value))
+        .ToList();
+
+    // Skips edits that change nothing and collects backup info.
+    public static List<PartEdits> DropUnchanged(PackageInspection inspection, IReadOnlyList<PartEdits> edits, List<MeshBackupStore.Change> changes)
+    {
+        var byPart = new Dictionary<int, List<ResourceEdit>>();
+        foreach (var part in edits)
+        {
+            var kept = byPart[part.PartIndex] = new List<ResourceEdit>();
+            foreach (var edit in part.Edits)
+            {
+                if (edit.NewData == null) { kept.Add(edit); continue; }
+                var res = inspection.Resources.FirstOrDefault(r => r.PartIndex == part.PartIndex && r.Key == edit.Key);
+                var stored = res != null ? inspection.ReadStored(res) : null;
+                if (stored != null && stored.AsSpan().SequenceEqual(edit.NewData)) continue;
+                kept.Add(edit);
+                if (stored != null) changes.Add(new MeshBackupStore.Change(part.PartIndex, edit.Key, stored, edit.NewData));
+            }
+        }
+        return Group(inspection, byPart);
+    }
+
+    // Reduces and saves the item, always starting from the original.
+    public async Task<CcOptimizeResult> OptimizeAsync(long itemId, TGI_Key? casPart, Action<CcAnalysis, CcOptimizePlan> configure, CancellationToken ct = default)
     {
         List<PartEdits> edits;
         CcOptimizeResult result;
+        var changes = new List<MeshBackupStore.Change>();
         using (var inspection = await _inspector.InspectAsync(itemId, ct))
         {
             (edits, result) = await Task.Run(() =>
             {
-                var analysis = Analyse(inspection, ct);
+                inspection.UseOriginals(MeshBackupStore.ValidOriginals(itemId, inspection));
+                var analysis = Analyse(inspection, casPart, ct);
                 var plan = CcOptimizePlan.SuggestedFor(analysis);
                 configure(analysis, plan);
                 var e = BuildEdits(inspection, analysis, plan, out var r);
-                return (e, r);
+                return (DropUnchanged(inspection, e, changes), r);
             }, ct);
         }
         await SaveAsync(itemId, edits);
+        MeshBackupStore.Record(itemId, changes);
         return result;
     }
 
-    // Saves edits from BuildEdits. Any inspection of the item must be disposed first.
+    public static List<PartEdits> BuildRestore(long itemId, PackageInspection inspection, IReadOnlyCollection<(int Part, TGI_Key Key)>? which, List<MeshBackupStore.Change> changes)
+    {
+        var byPart = new Dictionary<int, List<ResourceEdit>>();
+        foreach (var (res, original) in MeshBackupStore.ValidOriginals(itemId, inspection))
+        {
+            if (which != null && !which.Contains((res.PartIndex, res.Key))) continue;
+            if (!byPart.TryGetValue(res.PartIndex, out var list)) byPart[res.PartIndex] = list = new List<ResourceEdit>();
+            list.Add(new ResourceEdit(res.Key, original));
+        }
+        return DropUnchanged(inspection, Group(inspection, byPart), changes);
+    }
+
+    // Restores the originals (all when which is null). False when there was nothing to restore.
+    public async Task<bool> RestoreAsync(long itemId, IReadOnlyCollection<(int Part, TGI_Key Key)>? which = null, CancellationToken ct = default)
+    {
+        List<PartEdits> edits;
+        var changes = new List<MeshBackupStore.Change>();
+        using (var inspection = await _inspector.InspectAsync(itemId, ct))
+        {
+            edits = await Task.Run(() => BuildRestore(itemId, inspection, which, changes), ct);
+        }
+        if (edits.Count == 0) return false;
+        await SaveAsync(itemId, edits);
+        MeshBackupStore.Record(itemId, changes);
+        return true;
+    }
+
     public async Task SaveAsync(long itemId, IReadOnlyList<PartEdits> edits)
     {
         if (edits.Count == 0) return;
@@ -283,8 +655,7 @@ public class CcOptimizerService
         }
     }
 
-    // VPXY chunk: tag, version, table offset (from byte 12), table size, entry count, entries, then the key table
-    // (type, group, instance). Entry type 0 is a LOD: level, key count, key indices. Entry type 1 is a single index.
+    // VPXY: entry type 0 is a level (level, key count, key indices), type 1 a single index.
     internal static List<(int Lod, List<TGI_Key> Keys)> ReadVpxy(byte[] rcol)
     {
         if (rcol.Length < 20) throw new InvalidDataException("VPXY is too short");

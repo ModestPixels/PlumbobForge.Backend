@@ -3,10 +3,10 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using S3ForgeTools.GameFiles.Package;
 
 namespace PlumbobForge.Backend.Services;
 
-// One vertex attribute of a GEOM (position, normal, UV, bone data, vertex ID...).
 public sealed record GeomVertexFormat(uint Usage, uint DataType, byte Size)
 {
     public const uint UsagePosition = 1, UsageNormal = 2, UsageUv = 3, UsageBoneIndices = 4, UsageBoneWeights = 5,
@@ -14,20 +14,18 @@ public sealed record GeomVertexFormat(uint Usage, uint DataType, byte Size)
     public const uint DataTypeFloat = 1;
 }
 
-// A TS3 GEOM (0x015A1849) mesh: an RCOL container whose first chunk holds the mesh. Everything that is not the
-// vertex or index buffer is kept as-is, so reading and writing an unchanged mesh gives back the same bytes.
-// Ported from the web CC optimizer (geom.js).
+// TS3 GEOM mesh. Unchanged data is kept byte for byte. Ported from the web CC optimizer.
 public sealed class GeomMesh
 {
     public const uint ResourceType = 0x015A1849u;
+    // Shader hashes: hair strands use simhair.
+    public const uint SimHairShader = 0x84FD7152u;
 
-    // RCOL container
     private uint _rcolVersion, _publicChunks, _unused;
     private byte[][] _internalKeys = Array.Empty<byte[]>(); // 16 raw bytes each
     private byte[][] _externalKeys = Array.Empty<byte[]>();
     private byte[][] _otherChunks = Array.Empty<byte[]>();   // chunks after the GEOM one, untouched
 
-    // GEOM chunk
     public uint Version { get; private set; }
     public uint Shader { get; private set; }
     public byte[]? Material { get; private set; } // MTNF block, present when Shader != 0
@@ -43,6 +41,31 @@ public sealed class GeomMesh
     private byte[][] _tgis = Array.Empty<byte[]>(); // type, group, instance: 16 raw bytes each
 
     public int Triangles => Indices.Length / 3;
+    public bool IsHairShader => Shader == SimHairShader;
+
+    // Texture keys named by the mesh's material, by parameter hash.
+    public Dictionary<uint, TGI_Key> MaterialTextures()
+    {
+        var o = new Dictionary<uint, TGI_Key>();
+        var c = Material;
+        if (c == null) return o;
+        int block = c.AsSpan().IndexOf("MTNF"u8);
+        if (block < 0 || block + 16 > c.Length) return o;
+        int count = (int)Math.Min(BinaryPrimitives.ReadUInt32LittleEndian(c.AsSpan(block + 12)), 1024u);
+        for (int i = 0; i < count && block + 32 + i * 16 <= c.Length; i++)
+        {
+            int e = block + 16 + i * 16;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(c.AsSpan(e + 4)) != 4) continue;
+            int off = block + (int)BinaryPrimitives.ReadUInt32LittleEndian(c.AsSpan(e + 12));
+            if (off < 0 || off + 4 > c.Length) continue;
+            uint index = BinaryPrimitives.ReadUInt32LittleEndian(c.AsSpan(off));
+            if (index >= _tgis.Length) continue;
+            var t = _tgis[index];
+            o[BinaryPrimitives.ReadUInt32LittleEndian(c.AsSpan(e))] = new TGI_Key(
+                BinaryPrimitives.ReadUInt32LittleEndian(t), BinaryPrimitives.ReadUInt32LittleEndian(t.AsSpan(4)), BinaryPrimitives.ReadUInt64LittleEndian(t.AsSpan(8)));
+        }
+        return o;
+    }
     public bool HasVertexIds => Formats.Any(f => f.Usage == GeomVertexFormat.UsageVertexId);
 
     private GeomMesh() { }
@@ -139,7 +162,6 @@ public sealed class GeomMesh
         foreach (var t in _tgis) w.Write(t);
         w.Flush();
         var chunk = ms.ToArray();
-        // The offset counts from the end of the offset field itself (byte 12).
         BinaryPrimitives.WriteUInt32LittleEndian(chunk.AsSpan(8), (uint)(beforeTgi - 12));
         return WriteRcol(chunk);
     }
@@ -167,7 +189,25 @@ public sealed class GeomMesh
         return outBytes;
     }
 
-    // A copy that keeps only the given vertices (old indices, in their new order) with a new index buffer.
+    // Stand-in for object meshes; never written.
+    public static GeomMesh FromArrays(float[] positions, float[]? normals, float[]? uvs, uint[] indices)
+    {
+        int n = positions.Length / 3;
+        var formats = new List<GeomVertexFormat> { new(GeomVertexFormat.UsagePosition, GeomVertexFormat.DataTypeFloat, 12) };
+        if (normals != null) formats.Add(new(GeomVertexFormat.UsageNormal, GeomVertexFormat.DataTypeFloat, 12));
+        if (uvs != null) formats.Add(new(GeomVertexFormat.UsageUv, GeomVertexFormat.DataTypeFloat, 8));
+        int stride = formats.Sum(f => f.Size);
+        var data = new byte[n * stride];
+        for (int v = 0; v < n; v++)
+        {
+            int p = v * stride;
+            for (int k = 0; k < 3; k++, p += 4) BinaryPrimitives.WriteSingleLittleEndian(data.AsSpan(p), positions[v * 3 + k]);
+            if (normals != null) for (int k = 0; k < 3; k++, p += 4) BinaryPrimitives.WriteSingleLittleEndian(data.AsSpan(p), normals[v * 3 + k]);
+            if (uvs != null) for (int k = 0; k < 2; k++, p += 4) BinaryPrimitives.WriteSingleLittleEndian(data.AsSpan(p), uvs[v * 2 + k]);
+        }
+        return new GeomMesh { VertexCount = n, Formats = formats, Stride = stride, VertexData = data, Indices = indices };
+    }
+
     public GeomMesh WithGeometry(IReadOnlyList<int> keepVertices, uint[] newIndices)
     {
         var data = new byte[keepVertices.Count * Stride];
@@ -183,11 +223,8 @@ public sealed class GeomMesh
         return copy;
     }
 
-    // ------------------------------------------------------------------ vertex access
-
     private Dictionary<uint, float[]>? _attributes;
 
-    // Float components of the first attribute with this usage (e.g. 3 per vertex for positions), or null.
     public float[]? GetFloats(uint usage, out int components)
     {
         components = 0;
@@ -216,7 +253,6 @@ public sealed class GeomMesh
         return null;
     }
 
-    // Raw bytes of the first attribute with this usage per vertex (e.g. 4 for vertex IDs), or null.
     public byte[]? GetRaw(uint usage, out int size)
     {
         size = 0;

@@ -67,6 +67,9 @@ public sealed class InspectedObject
     public bool IsDisabled { get; set; }
     // Filled in separately by MeshStatsService, because reading meshes takes a while.
     public MeshStats? Mesh { get; set; }
+    // Set when the item was optimized: counts before, and the resources to restore.
+    public MeshStats? OriginalMesh { get; set; }
+    public IReadOnlyList<(int Part, TGI_Key Key)> OptimizedKeys { get; set; } = Array.Empty<(int Part, TGI_Key Key)>();
     public List<InspectedThumbnail> Thumbnails { get; } = new();
 }
 

@@ -76,6 +76,77 @@ public class MeshReportService
         }
     }
 
+    // Returns how many objects use a mesh from another package (and so have no row).
+    private static int CollectRows(MetaEntity meta, PackageInspection inspection, ISet<(long, TGI_Key)> disabled, Action<MeshReportRow> add)
+    {
+        int external = 0;
+        foreach (var obj in inspection.Objects)
+        {
+            var mesh = obj.Mesh;
+            if (mesh == null) continue;
+            if (!mesh.HasData)
+            {
+                if (mesh.HasExternalMesh) external++;
+                continue;
+            }
+            add(new MeshReportRow
+            {
+                MetaEntityId = meta.Id,
+                SetId = meta.SetsEntityId,
+                SetName = meta.SetsEntity?.Name ?? string.Empty,
+                FileName = meta.FileName,
+                IsVault = meta.IsVaultManaged,
+                Kind = obj.Kind,
+                Name = obj.Name ?? obj.InternalName,
+                ClothingType = obj.ClothingType,
+                CategoryKey = obj.CategoryKey,
+                IsOff = disabled.Contains((meta.Id, obj.Resource.Key)),
+                ResourceKey = obj.Resource.Key,
+                Thumbnail = ReadThumbnail(inspection, obj),
+                Triangles = mesh.Triangles,
+                Vertices = mesh.Vertices,
+                LodCount = mesh.Lods.Count
+            });
+        }
+        return external;
+    }
+
+    // Rows for one item, after a tool changed its meshes; null when the item is gone or unreadable.
+    public async Task<List<MeshReportRow>?> ScanItemAsync(long metaEntityId, CancellationToken ct = default)
+    {
+        var meta = await _db.MetaEntities.AsNoTracking()
+            .Include(m => m.SetsEntity)
+            .FirstOrDefaultAsync(m => m.Id == metaEntityId, ct);
+        if (meta == null) return null;
+
+        var disabled = (await _db.DisabledObjects.AsNoTracking()
+                .Where(d => d.MetaEntityId == metaEntityId)
+                .Select(d => new { d.Type, d.Group, d.Instance })
+                .ToListAsync(ct))
+            .Select(d => (metaEntityId, new TGI_Key(d.Type, d.Group, d.Instance)))
+            .ToHashSet();
+
+        try
+        {
+            using var inspection = await _inspector.InspectAsync(meta.Id, ct);
+            var rows = new List<MeshReportRow>();
+            await Task.Run(() =>
+            {
+                MeshStatsService.Analyse(inspection, ct);
+                CollectRows(meta, inspection, disabled, rows.Add);
+            }, ct);
+            return rows;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public async Task<MeshReportSummary> ScanAsync(IProgress<(int Done, int Total)>? progress = null, CancellationToken ct = default)
     {
         // A vault Sims3Pack's own packages are items of their own; they are read through the parent.
@@ -99,34 +170,8 @@ public class MeshReportService
 
         void Collect(MetaEntity meta, PackageInspection inspection)
         {
-            foreach (var obj in inspection.Objects)
-            {
-                var mesh = obj.Mesh;
-                if (mesh == null) continue;
-                if (!mesh.HasData)
-                {
-                    if (mesh.HasExternalMesh) Interlocked.Increment(ref external);
-                    continue;
-                }
-                rows.Add(new MeshReportRow
-                {
-                    MetaEntityId = meta.Id,
-                    SetId = meta.SetsEntityId,
-                    SetName = meta.SetsEntity?.Name ?? string.Empty,
-                    FileName = meta.FileName,
-                    IsVault = meta.IsVaultManaged,
-                    Kind = obj.Kind,
-                    Name = obj.Name ?? obj.InternalName,
-                    ClothingType = obj.ClothingType,
-                    CategoryKey = obj.CategoryKey,
-                    IsOff = disabled.Contains((meta.Id, obj.Resource.Key)),
-                    ResourceKey = obj.Resource.Key,
-                    Thumbnail = ReadThumbnail(inspection, obj),
-                    Triangles = mesh.Triangles,
-                    Vertices = mesh.Vertices,
-                    LodCount = mesh.Lods.Count
-                });
-            }
+            int ext = CollectRows(meta, inspection, disabled, rows.Add);
+            if (ext > 0) Interlocked.Add(ref external, ext);
         }
 
         await Task.Run(() =>

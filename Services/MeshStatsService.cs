@@ -13,7 +13,8 @@ public static class MeshStatsService
     private const uint Vpxy = 0x736884F1u;
 
     /// <summary>Fills <see cref="InspectedObject.Mesh"/> for each object. Reading meshes is slow, so call it off the UI thread.</summary>
-    public static void Analyse(PackageInspection inspection, CancellationToken ct = default)
+    // originals: backups, used to fill OriginalMesh.
+    public static void Analyse(PackageInspection inspection, CancellationToken ct = default, IReadOnlyDictionary<InspectedResource, byte[]>? originals = null)
     {
         var byKey = new Dictionary<(int Part, TGI_Key Key), InspectedResource>();
         var anyKey = new Dictionary<TGI_Key, InspectedResource>();
@@ -39,11 +40,11 @@ public static class MeshStatsService
             MeshStatsReader.ResourceReader read = key =>
             {
                 if (!byKey.TryGetValue((part, key), out var resource) && !anyKey.TryGetValue(key, out resource)) return null;
-                try { return inspection.Read(resource); }
+                try { return inspection.ReadStored(resource); }
                 catch { return null; }
             };
 
-            try
+            MeshStats Measure(MeshStatsReader.ResourceReader reader, Dictionary<TGI_Key, MeshLod?> meshCache)
             {
                 var data = inspection.Read(obj.Resource);
                 if (obj.Kind == InspectedObjectKind.Cas)
@@ -53,16 +54,18 @@ public static class MeshStatsService
                         orphans = FindOrphans(inspection, part, read);
                         orphansByPart[part] = orphans;
                     }
-                    obj.Mesh = MeshStatsReader.ReadCas(data, read, orphans, caspCountByPart.GetValueOrDefault(part) == 1, cache);
+                    return MeshStatsReader.ReadCas(data, reader, orphans, caspCountByPart.GetValueOrDefault(part) == 1, meshCache);
                 }
-                else if (obj.Resource.Key.Type == Sims3ResourceTypes.Objd)
+                if (obj.Resource.Key.Type == Sims3ResourceTypes.Objd)
                 {
-                    obj.Mesh = MeshStatsReader.ReadObject(data, read, cache);
+                    return MeshStatsReader.ReadObject(data, reader, meshCache);
                 }
-                else
-                {
-                    obj.Mesh = MeshStats.None;
-                }
+                return MeshStats.None;
+            }
+
+            try
+            {
+                obj.Mesh = Measure(read, cache);
             }
             catch (OperationCanceledException)
             {
@@ -71,6 +74,36 @@ public static class MeshStatsService
             catch
             {
                 obj.Mesh = MeshStats.None;
+            }
+
+            if (originals is not { Count: > 0 } || obj.Mesh is not { Lods.Count: > 0 } now) continue;
+            var used = new HashSet<(int Part, TGI_Key Key)>();
+            MeshStatsReader.ResourceReader readOriginal = key =>
+            {
+                if (!byKey.TryGetValue((part, key), out var resource) && !anyKey.TryGetValue(key, out resource)) return null;
+                if (originals.TryGetValue(resource, out var original))
+                {
+                    used.Add((resource.PartIndex, resource.Key));
+                    return original;
+                }
+                try { return inspection.ReadStored(resource); }
+                catch { return null; }
+            };
+            try
+            {
+                var before = Measure(readOriginal, new Dictionary<TGI_Key, MeshLod?>());
+                if (used.Count > 0 && before.Lods.Count > 0 && !before.Lods.SequenceEqual(now.Lods))
+                {
+                    obj.OriginalMesh = before;
+                    obj.OptimizedKeys = used.ToList();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
             }
         }
     }

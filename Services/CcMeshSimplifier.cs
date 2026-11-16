@@ -5,14 +5,9 @@ using Evergine.Bindings.MeshOptimizer;
 
 namespace PlumbobForge.Backend.Services;
 
-public sealed record CcSimplifyResult(GeomMesh Geom, int Triangles, int Vertices, bool DoubleSided);
+public sealed record CcSimplifyResult(GeomMesh Geom, int Triangles, int Vertices, bool DoubleSided, IReadOnlyList<int>? Keep = null);
 
-// Polygon reduction of one GEOM with meshoptimizer, ported from the web CC optimizer (simplify.js).
-// meshoptimizer only collapses edges onto existing vertices and never invents new ones, so the reduced mesh is a
-// subset of the original vertices: bone weights, vertex IDs (used by fat/fit/thin morphs) and UVs stay valid.
-// Double-sided meshes: converted TS4 alpha hair is usually made double-sided by duplicating every strand with
-// flipped normals. The copy shares positions but not vertices, which the simplifier would treat as seams. That
-// layout is detected, only the front layer is reduced, and the back layer is rebuilt as its exact mirror.
+// Triangle reduction with meshoptimizer, ported from the web CC optimizer. Double-sided hair is reduced on the front layer and the back is rebuilt as its mirror.
 public static class CcMeshSimplifier
 {
     private static readonly float[] AttributeWeights = { 0.5f, 0.5f, 0.5f, 1f, 1f }; // normal xyz, uv
@@ -27,18 +22,18 @@ public static class CcMeshSimplifier
         public int MirroredTriangles { get; init; }
     }
 
-    // ------------------------------------------------------------------ double-sided detection
-
     public static Layers AnalyzeLayers(GeomMesh geom)
     {
         var pos = geom.GetFloats(GeomVertexFormat.UsagePosition, out _) ?? throw new InvalidOperationException("The mesh has no positions");
         var nrm = geom.GetFloats(GeomVertexFormat.UsageNormal, out int nrmN);
-        if (nrmN != 3) nrm = null;
-        var I = geom.Indices;
-        int triCount = I.Length / 3, n = geom.VertexCount;
+        return AnalyzeLayers(pos, nrmN == 3 ? nrm : null, geom.Indices, geom.VertexCount);
+    }
+
+    public static Layers AnalyzeLayers(float[] pos, float[]? nrm, uint[] I, int n)
+    {
+        int triCount = I.Length / 3;
         var remap = PositionRemap(pos, n);
 
-        // Connected components by vertex index (front and back layers don't share vertices).
         var parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
         int Find(int x) { while (parent[x] != x) x = parent[x] = parent[parent[x]]; return x; }
@@ -59,7 +54,6 @@ public static class CcMeshSimplifier
             return nrm[a * 3] * nrm[b * 3] + nrm[a * 3 + 1] * nrm[b * 3 + 1] + nrm[a * 3 + 2] * nrm[b * 3 + 2] < 0;
         }
 
-        // Match triangles that cover the same positions with disjoint vertices and opposite normals.
         var byKey = new Dictionary<(uint, uint, uint), List<int>>();
         var mirrorOf = new int[triCount];
         Array.Fill(mirrorOf, -1);
@@ -76,7 +70,6 @@ public static class CcMeshSimplifier
             else list.Add(t);
         }
 
-        // Pick a consistent "front" per component pair.
         const byte Front = 1, Back = 2, Mixed = 3;
         var side = new Dictionary<int, byte>();
         for (int t = 0; t < triCount; t++)
@@ -109,13 +102,11 @@ public static class CcMeshSimplifier
                     tw[j] = remap[uv[0]] == target ? uv[0] : remap[uv[1]] == target ? uv[1] : uv[2];
                     twin[I[t * 3 + j]] = (int)tw[j];
                 }
-                // Is the back triangle wound the opposite way? (cyclic order of tw vs uv)
                 int k = uv.IndexOf(tw[0]);
                 if (uv[(k + 1) % 3] == tw[1]) same++; else reversed++;
             }
             else if (u >= 0 && SideOf(c) == Back && SideOf(Find((int)I[u * 3])) == Front)
             {
-                // regenerated from its front partner
             }
             else single.Add(t);
         }
@@ -140,11 +131,7 @@ public static class CcMeshSimplifier
         return (a, b, c);
     }
 
-    // ------------------------------------------------------------------ simplification
-
-    // ratio: 0..1, fraction of triangles to keep.
-    // lockEdges: Keep open edges (necklines, cuffs, waistbands) exactly in place.
-    // layers: Result of AnalyzeLayers for this mesh, when already known.
+    // ratio: fraction of triangles to keep.
     public static CcSimplifyResult Simplify(GeomMesh geom, double ratio, bool lockEdges = true, Layers? layers = null)
     {
         int triangles = geom.Triangles;
@@ -154,7 +141,13 @@ public static class CcMeshSimplifier
         var pos = geom.GetFloats(GeomVertexFormat.UsagePosition, out _)!;
         var nrm = geom.GetFloats(GeomVertexFormat.UsageNormal, out int nrmN);
         var uvs = geom.GetFloats(GeomVertexFormat.UsageUv, out int uvN);
-        int n = geom.VertexCount;
+        var (keep, newIdx) = SimplifyIndices(pos, nrm, nrmN, uvs, uvN, geom.Indices, geom.VertexCount, ratio, lockEdges, layers);
+        return new CcSimplifyResult(geom.WithGeometry(keep, newIdx), newIdx.Length / 3, keep.Count, layers.DoubleSided, keep);
+    }
+
+    public static (List<int> Keep, uint[] Indices) SimplifyIndices(float[] pos, float[]? nrm, int nrmN, float[]? uvs, int uvN,
+        uint[] indices, int n, double ratio, bool lockEdges, Layers layers)
+    {
         var extra = new float[n * 5];
         for (int v = 0; v < n; v++)
         {
@@ -165,10 +158,9 @@ public static class CcMeshSimplifier
         uint[] idx;
         if (layers.DoubleSided)
         {
-            var f = Reduce(Pick(geom.Indices, layers.Front), pos, n, extra, ratio, lockEdges);
-            var s = Reduce(Pick(geom.Indices, layers.Single), pos, n, extra, ratio, lockEdges);
+            var f = Reduce(Pick(indices, layers.Front), pos, n, extra, ratio, lockEdges);
+            var s = Reduce(Pick(indices, layers.Single), pos, n, extra, ratio, lockEdges);
             idx = new uint[f.Length * 2 + s.Length];
-            // Interleave each front triangle with its back copy so a strand's two sides stay next to each other.
             for (int i = 0; i < f.Length; i += 3)
             {
                 uint a = (uint)layers.Twin[f[i]], b = (uint)layers.Twin[f[i + 1]], c = (uint)layers.Twin[f[i + 2]];
@@ -181,10 +173,9 @@ public static class CcMeshSimplifier
         }
         else
         {
-            idx = Reduce(geom.Indices, pos, n, extra, ratio, lockEdges);
+            idx = Reduce(indices, pos, n, extra, ratio, lockEdges);
         }
 
-        // Compact: keep only referenced vertices, preserving their original order.
         var used = new bool[n];
         foreach (uint i in idx) used[i] = true;
         var keep = new List<int>();
@@ -198,7 +189,7 @@ public static class CcMeshSimplifier
         }
         var newIdx = new uint[idx.Length];
         for (int i = 0; i < idx.Length; i++) newIdx[i] = (uint)remap[idx[i]];
-        return new CcSimplifyResult(geom.WithGeometry(keep, newIdx), newIdx.Length / 3, keep.Count, layers.DoubleSided);
+        return (keep, newIdx);
     }
 
     private static uint[] Pick(uint[] indices, int[] tris)
@@ -215,8 +206,7 @@ public static class CcMeshSimplifier
     {
         if (indices.Length < 12) return indices;
         int target = Math.Max(3, (int)Math.Floor(indices.Length / 3.0 * ratio) * 3);
-        // Sparse: only consider vertices referenced by these triangles (the hidden back layer shares positions with
-        // the front and would otherwise look like seams).
+        // Only these triangles' vertices, so the hidden back layer isn't seen as seams.
         uint options = (uint)SimplifyOptions.Sparse | (lockEdges ? (uint)SimplifyOptions.LockBorder : 0u);
         var dest = new uint[indices.Length];
         nuint count;

@@ -95,60 +95,94 @@ public static class MeshStatsReader
         }
         return allGeoms.Where(g => !listed.Contains(g)).ToList();
     }
+    // OBJD -> OBJK -> MODLs. external: something is missing from the package.
+    internal static List<TGI_Key> ObjectModelKeys(byte[] objd, ResourceReader read, out bool external)
+    {
+        var item = new ResourceOBJD(objd);
+        var refs = item.ReferenceTable;
+        var objkKeys = new List<TGI_Key>();
+        if (item.ObjkIndex >= 0 && item.ObjkIndex < refs.Count && refs[item.ObjkIndex].Type == Objk)
+        {
+            objkKeys.Add(refs[item.ObjkIndex]);
+        }
+        else
+        {
+            objkKeys.AddRange(refs.Where(k => k.Type == Objk));
+        }
+
+        external = false;
+        var modlKeys = new List<TGI_Key>();
+        foreach (var objkKey in objkKeys)
+        {
+            var objk = read(objkKey);
+            if (objk == null) { external = true; continue; }
+
+            foreach (var key in ReadObjkTable(objk))
+            {
+                if (key.Type == Modl)
+                {
+                    modlKeys.Add(key);
+                }
+                else if (key.Type == Vpxy)
+                {
+                    var vpxy = read(key);
+                    if (vpxy == null) { external = true; continue; }
+                    modlKeys.AddRange(ReadChunkTable(vpxy).Where(k => k.Type == Modl));
+                }
+            }
+        }
+        return modlKeys;
+    }
+
     public static MeshStats ReadObject(byte[] objd, ResourceReader read, Dictionary<TGI_Key, MeshLod?>? cache = null)
     {
         try
         {
-            var item = new ResourceOBJD(objd);
-            var refs = item.ReferenceTable;
-            var objkKeys = new List<TGI_Key>();
-            if (item.ObjkIndex >= 0 && item.ObjkIndex < refs.Count && refs[item.ObjkIndex].Type == Objk)
-            {
-                objkKeys.Add(refs[item.ObjkIndex]);
-            }
-            else
-            {
-                objkKeys.AddRange(refs.Where(k => k.Type == Objk));
-            }
+            var modlKeys = ObjectModelKeys(objd, read, out bool external);
 
-            bool external = false;
-            var modlKeys = new List<TGI_Key>();
-            foreach (var objkKey in objkKeys)
-            {
-                var objk = read(objkKey);
-                if (objk == null) { external = true; continue; }
+            var levels = new SortedDictionary<int, MeshLod>();
+            void AddLevel(int level, MeshLod lod) =>
+                levels[level] = levels.TryGetValue(level, out var had) ? new MeshLod(had.Triangles + lod.Triangles, had.Vertices + lod.Vertices) : lod;
 
-                foreach (var key in ReadObjkTable(objk))
-                {
-                    if (key.Type == Modl)
-                    {
-                        modlKeys.Add(key);
-                    }
-                    else if (key.Type == Vpxy)
-                    {
-                        var vpxy = read(key);
-                        if (vpxy == null) { external = true; continue; }
-                        modlKeys.AddRange(ReadChunkTable(vpxy).Where(k => k.Type == Modl));
-                    }
-                }
-            }
-
-            var lods = new List<MeshLod>();
-            var seen = new HashSet<TGI_Key>();
             foreach (var modlKey in modlKeys.Distinct())
             {
                 var modl = read(modlKey);
                 if (modl == null) { external = true; continue; }
-                if (!TryReadRcol(modl, out var references, out _)) continue;
 
-                foreach (var mlodKey in references.Where(k => k.Type == Mlod))
+                List<ModlLod> modlLods;
+                RcolFile rcol;
+                try
                 {
-                    if (!seen.Add(mlodKey)) continue;
-                    if (!TryReadCached(mlodKey, read, cache, TryReadMlod, out var lod, out bool missing)) { external |= missing; continue; }
-                    lods.Add(lod);
+                    rcol = RcolFile.Read(modl);
+                    int at = Enumerable.Range(0, rcol.Chunks.Count).FirstOrDefault(i => rcol.TagOf(i) == "MODL", -1);
+                    if (at < 0) continue;
+                    modlLods = ModlChunk.ReadLods(rcol.Chunks[at]);
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+
+                // Shadow levels are skipped.
+                var seen = new HashSet<(TGI_Key, int)>();
+                foreach (var entry in modlLods)
+                {
+                    if (entry.IsShadow) continue;
+                    if (rcol.ExternalKey(entry.ModelRef) is { } mlodKey)
+                    {
+                        if (mlodKey.Type != Mlod || !seen.Add((mlodKey, -1))) continue;
+                        if (!TryReadCached(mlodKey, read, cache, TryReadMlod, out var lod, out bool missing)) { external |= missing; continue; }
+                        AddLevel(entry.Level, lod);
+                    }
+                    else if (rcol.ChunkIndex(entry.ModelRef) is var chunk and >= 0 && rcol.TagOf(chunk) == "MLOD" && seen.Add((modlKey, chunk)))
+                    {
+                        if (TryCountMlodChunk(rcol.Chunks[chunk], out var lod)) AddLevel(entry.Level, lod);
+                    }
                 }
             }
-            return Build(lods, external);
+            var lods = levels.Values.ToList();
+            lods.RemoveAll(l => l.Triangles <= 0);
+            return lods.Count == 0 && !external ? MeshStats.None : new MeshStats(lods, external);
         }
         catch (Exception)
         {
@@ -194,7 +228,7 @@ public static class MeshStatsReader
             : new MeshStats(lods.OrderByDescending(l => l.Triangles).ThenByDescending(l => l.Vertices).ToList(), external);
 
     // CASP: header (version, table offset), then ... a byte count and keys stored instance, group, type.
-    private static List<TGI_Key> ReadCaspTable(byte[] d)
+    internal static List<TGI_Key> ReadCaspTable(byte[] d)
     {
         var list = new List<TGI_Key>();
         if (d.Length < 16) return list;
@@ -339,8 +373,6 @@ public static class MeshStatsReader
         return true;
     }
 
-    // MLOD: tag, version, mesh count, then per mesh a size and the mesh record. In a record the vertex count is the
-    // 11th and the primitive (triangle) count the 12th 32-bit value.
     private static bool TryReadMlod(byte[] d, out MeshLod lod)
     {
         lod = new MeshLod(0, 0);
@@ -349,22 +381,31 @@ public static class MeshStatsReader
         foreach (var (start, size) in chunks)
         {
             if (!TryReadTag(d, start, size, "MLOD")) continue;
-            var span = d.AsSpan(start, size);
-            int pos = 8;
-            if (!Read32(span, ref pos, out uint meshCount) || meshCount > 4096) return false;
-
-            long triangles = 0, vertices = 0;
-            for (uint i = 0; i < meshCount; i++)
-            {
-                if (!Read32(span, ref pos, out uint recordSize) || recordSize < 52 || pos + recordSize > span.Length) return false;
-                vertices += BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 40)..]);
-                triangles += BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 44)..]);
-                pos += (int)recordSize;
-            }
-            lod = new MeshLod((int)triangles, (int)vertices);
-            return true;
+            return TryCountMlodChunk(d.AsSpan(start, size), out lod);
         }
         return false;
+    }
+
+    // Counts an MLOD chunk; shadow meshes (no vertex layout) don't count.
+    private static bool TryCountMlodChunk(ReadOnlySpan<byte> span, out MeshLod lod)
+    {
+        lod = new MeshLod(0, 0);
+        int pos = 8;
+        if (!Read32(span, ref pos, out uint meshCount) || meshCount > 4096) return false;
+
+        long triangles = 0, vertices = 0;
+        for (uint i = 0; i < meshCount; i++)
+        {
+            if (!Read32(span, ref pos, out uint recordSize) || recordSize < 52 || pos + recordSize > span.Length) return false;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 8)..]) != 0)
+            {
+                vertices += BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 40)..]);
+                triangles += BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 44)..]);
+            }
+            pos += (int)recordSize;
+        }
+        lod = new MeshLod((int)triangles, (int)vertices);
+        return true;
     }
 
     private static bool Read32(ReadOnlySpan<byte> span, ref int pos, out uint value)

@@ -8,10 +8,9 @@ using System.Text.RegularExpressions;
 
 namespace PlumbobForge.Backend.Services;
 
-// An RGBA8 image, rows top to bottom.
 public sealed record RgbaImage(int Width, int Height, byte[] Rgba, string Label = "");
 
-// DDS decoding on the CPU: top mip level of DXT1/3/5 and 24/32-bit RGB(A). Ported from the web CC optimizer (textures.js).
+// DDS decoding (DXT1/3/5, RGB(A)). Ported from the web CC optimizer.
 public static class DdsDecoder
 {
     public static RgbaImage Decode(byte[] bytes)
@@ -114,7 +113,6 @@ public static class DdsDecoder
 
 public sealed record CasPattern(string Name, double[]? Color, bool Enabled);
 
-// A colour variation of a CAS part, stored as XML inside the CASP.
 public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, string> Values, IReadOnlyDictionary<string, CasPattern> Patterns)
 {
     public bool IsHair => Complate.Contains("hair", StringComparison.OrdinalIgnoreCase)
@@ -135,7 +133,6 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
             string xml = m.Value;
             string complate = ComplateRx.Match(xml) is { Success: true } c ? c.Groups[1].Value : "";
             var patterns = new Dictionary<string, (string Name, double[]? Color)>();
-            // Pattern blocks first, so their inner values do not leak into the top-level values.
             string top = PatternRx.Replace(xml, pm =>
             {
                 var at = Attrs(pm.Groups[1].Value);
@@ -173,16 +170,12 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
     internal static double[]? ParseColor(string? s)
     {
         if (s == null) return null;
-        // Like Number() in the web tool: blank is 0, anything unreadable is NaN.
         return s.Split(',').Take(3).Select(x => string.IsNullOrWhiteSpace(x) ? 0
             : double.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : double.NaN).ToArray();
     }
 }
 
-// Approximate "in-game look" of a CAS part for the preview. The game composites CAS textures with shaders and pattern
-// files from the game install, so this is an approximation (ported from the web CC optimizer, material.js):
-//   clothing: Multiplier x pattern colours chosen by the Mask's R/G/B/A, then the Overlay alpha-blended on top;
-//   hair: greyscale Diffuse Map tinted with the preset's base/root/highlight/tip colours via the Control Map.
+// Approximate in-game look for the preview (ported from the web CC optimizer).
 public static class CcMaterial
 {
     public const uint TextureType = 0x00B2D882u;
@@ -190,7 +183,6 @@ public static class CcMaterial
 
     private static readonly string[] RoleOrder = { "Diffuse Map", "Multiplier", "Overlay", "Mask", "Control Map", "Clothing Specular", "Specular Map" };
 
-    // Texture roles of a preset that point at a texture inside the package.
     public static Dictionary<string, InspectedResource> PresetTextures(PackageInspection inspection, CasPreset preset)
     {
         var byInstance = new Dictionary<ulong, InspectedResource>();
@@ -205,15 +197,15 @@ public static class CcMaterial
         return o;
     }
 
-    // Roles that can be shown as a single raw texture, in a sensible order.
     public static List<string> TextureRoles(PackageInspection inspection, CasPreset preset) =>
         PresetTextures(inspection, preset).Keys
             .OrderBy(r => Array.IndexOf(RoleOrder, r) is var i && i >= 0 ? i + 1 : 99)
             .ThenBy(r => r, StringComparer.Ordinal)
             .ToList();
 
-    // mode: InGame, or a role name (raw texture with alpha forced opaque). Null when the package has no usable texture.
-    public static RgbaImage? PreviewTexture(PackageInspection inspection, CasPreset preset, string mode = InGame, Dictionary<InspectedResource, RgbaImage>? cache = null)
+    // mode: InGame or a role name.
+    public static RgbaImage? PreviewTexture(PackageInspection inspection, CasPreset preset, string mode = InGame, Dictionary<InspectedResource, RgbaImage>? cache = null,
+        IEnumerable<GeomMesh>? meshes = null)
     {
         var roles = PresetTextures(inspection, preset);
         RgbaImage Decode(InspectedResource r)
@@ -233,12 +225,72 @@ public static class CcMaterial
             return new RgbaImage(img.Width, img.Height, rgba, mode);
         }
         var result = preset.IsHair ? Hair(preset, roles, Decode) : Clothing(preset, roles, Decode);
+        if (result != null && preset.IsHair && meshes != null) PaintSolidParts(result, preset, roles, Decode, meshes);
         if (result != null) BleedTransparent(result.Rgba);
         return result;
     }
 
-    // Transparent texels usually hold white or garbage colour, which bleeds into strand edges as a bright fringe once
-    // the texture is filtered. Fill them with the average opaque colour.
+    // Paints solid parts of a hair (like a hat) with the clothing colours.
+    private static void PaintSolidParts(RgbaImage hair, CasPreset preset, Dictionary<string, InspectedResource> roles, Func<InspectedResource, RgbaImage> decode, IEnumerable<GeomMesh> meshes)
+    {
+        var solid = meshes.Where(m => m.Shader != 0 && !m.IsHairShader).ToList();
+        if (solid.Count == 0 || !roles.ContainsKey("Multiplier")) return;
+        var clothing = Clothing(preset, roles, decode);
+        if (clothing == null) return;
+
+        int w = hair.Width, h = hair.Height;
+        var covered = new bool[w * h];
+        foreach (var g in solid)
+        {
+            var uv = g.GetFloats(GeomVertexFormat.UsageUv, out int n);
+            if (uv == null || n < 2) continue;
+            var I = g.Indices;
+            for (int t = 0; t + 2 < I.Length; t += 3)
+            {
+                if (I[t] >= g.VertexCount || I[t + 1] >= g.VertexCount || I[t + 2] >= g.VertexCount) continue;
+                FillTriangle(covered, w, h,
+                    uv[I[t] * n] * w, uv[I[t] * n + 1] * h,
+                    uv[I[t + 1] * n] * w, uv[I[t + 1] * n + 1] * h,
+                    uv[I[t + 2] * n] * w, uv[I[t + 2] * n + 1] * h);
+            }
+        }
+
+        var cs = Sampler(clothing, w, h)!;
+        var o = hair.Rgba;
+        for (int i = 0; i < w * h; i++)
+        {
+            if (!covered[i]) continue;
+            int d = i * 4, q = cs(i);
+            o[d] = clothing.Rgba[q]; o[d + 1] = clothing.Rgba[q + 1]; o[d + 2] = clothing.Rgba[q + 2]; o[d + 3] = 255;
+        }
+    }
+
+    private static void FillTriangle(bool[] covered, int w, int h, double x0, double y0, double x1, double y1, double x2, double y2)
+    {
+        int minX = Math.Max(0, (int)Math.Floor(Math.Min(x0, Math.Min(x1, x2))) - 1), maxX = Math.Min(w - 1, (int)Math.Ceiling(Math.Max(x0, Math.Max(x1, x2))) + 1);
+        int minY = Math.Max(0, (int)Math.Floor(Math.Min(y0, Math.Min(y1, y2))) - 1), maxY = Math.Min(h - 1, (int)Math.Ceiling(Math.Max(y0, Math.Max(y1, y2))) + 1);
+        if (minX > maxX || minY > maxY) return;
+        double area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if (Math.Abs(area) < 1e-9) return;
+        double l01 = Math.Max(1e-9, Math.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)));
+        double l12 = Math.Max(1e-9, Math.Sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)));
+        double l20 = Math.Max(1e-9, Math.Sqrt((x0 - x2) * (x0 - x2) + (y0 - y2) * (y0 - y2)));
+        double sign = Math.Sign(area);
+        for (int y = minY; y <= maxY; y++)
+        {
+            double py = y + 0.5;
+            for (int x = minX; x <= maxX; x++)
+            {
+                double px = x + 0.5;
+                double e0 = sign * ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) / l01;
+                double e1 = sign * ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) / l12;
+                double e2 = sign * ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) / l20;
+                if (e0 >= -1.5 && e1 >= -1.5 && e2 >= -1.5) covered[y * w + x] = true;
+            }
+        }
+    }
+
+    // Fills see-through pixels with the average colour, so edges don't get a bright fringe.
     private static void BleedTransparent(byte[] p)
     {
         double s0 = 0, s1 = 0, s2 = 0;
@@ -257,10 +309,8 @@ public static class CcMaterial
         }
     }
 
-    // Matches assigning a number to a Uint8Array in the web tool (truncate), clamped.
     private static byte ToByte(double v) => double.IsNaN(v) ? (byte)0 : (byte)Math.Clamp((int)v, 0, 255);
 
-    // Nearest-neighbour lookup so textures of different sizes can be combined.
     private static Func<int, int>? Sampler(RgbaImage? img, int w, int h)
     {
         if (img == null) return null;
@@ -315,7 +365,6 @@ public static class CcMaterial
         var over = roles.TryGetValue("Overlay", out var oe) ? decode(oe) : null;
         var ms = Sampler(mask, w, h);
         var os = Sampler(over, w, h);
-        // Mask channel R/G/B/A -> Pattern A/B/C/D colour (only enabled patterns tint)
         var pats = new[] { "Pattern A", "Pattern B", "Pattern C", "Pattern D" }
             .Select(n => preset.Patterns.TryGetValue(n, out var p) && p.Enabled && p.Color != null ? p.Color : null)
             .ToArray();
@@ -351,10 +400,8 @@ public static class CcMaterial
         return new RgbaImage(w, h, o, "Preset colours (approx.)");
     }
 
-    // Should the texture's alpha cut holes in these meshes? TS3 textures are atlases whose alpha is often just "unused
-    // area", so only when a real share of the meshes' own UVs land on transparent pixels. Samples triangle centres,
-    // since vertices sit on UV island edges where alpha often fades out.
-    public static bool UsesCutout(RgbaImage tex, IEnumerable<GeomMesh> geoms)
+    // Whether the alpha should cut holes in these meshes. wrap: UVs repeat (objects).
+    public static bool UsesCutout(RgbaImage tex, IEnumerable<GeomMesh> geoms, bool wrap = false)
     {
         long total = 0, clear = 0;
         foreach (var g in geoms)
@@ -368,6 +415,7 @@ public static class CcMaterial
             {
                 uint a = I[t * 3], b = I[t * 3 + 1], c = I[t * 3 + 2];
                 double u = (uv[a * n] + uv[b * n] + uv[c * n]) / 3.0, v = (uv[a * n + 1] + uv[b * n + 1] + uv[c * n + 1]) / 3.0;
+                if (wrap) { u -= Math.Floor(u); v -= Math.Floor(v); }
                 int x = Math.Min(tex.Width - 1, Math.Max(0, (int)Math.Floor(u * tex.Width)));
                 int y = Math.Min(tex.Height - 1, Math.Max(0, (int)Math.Floor(v * tex.Height)));
                 total++;

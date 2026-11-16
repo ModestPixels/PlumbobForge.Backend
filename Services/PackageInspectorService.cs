@@ -41,7 +41,18 @@ public sealed class PackageInspection : IDisposable
 
     internal void Own(IDisposable disposable) => _owned.Add(disposable);
 
-    public byte[] Read(InspectedResource resource)
+    private IReadOnlyDictionary<InspectedResource, byte[]>? _originals;
+
+    public IReadOnlyDictionary<InspectedResource, byte[]> Originals => _originals ?? new Dictionary<InspectedResource, byte[]>();
+
+    // After this, Read returns the originals.
+    public void UseOriginals(IReadOnlyDictionary<InspectedResource, byte[]> originals) => _originals = originals.Count > 0 ? originals : null;
+
+    public byte[] Read(InspectedResource resource) =>
+        _originals != null && _originals.TryGetValue(resource, out var original) ? original : ReadStored(resource);
+
+    // Ignores UseOriginals.
+    public byte[] ReadStored(InspectedResource resource)
     {
         lock (_readLock)
         {

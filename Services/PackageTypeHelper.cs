@@ -16,6 +16,7 @@ public static class PackageTypeHelper
 
     public const uint TypeOBJD = 0x319E4F1D;
 
+    // Kept as a list so EF Core can translate it to SQL (m.PackageType IN (...)).
     public static readonly string[] BuildBuyTypes =
     [
         "BuildBuy",
@@ -25,6 +26,12 @@ public static class PackageTypeHelper
         "Build-Buy",
         "buildbuy",
         "object"
+    ];
+
+    // Same names IsCas accepts, as a list EF Core can translate to SQL.
+    public static readonly string[] CasTypes =
+    [
+        "CAS", "cas", "Hair", "Clothing", "Accessories", "Details", "Skin", "Skins", "Sliders", "Presets"
     ];
 
     public static bool IsBuildBuy(string? packageType)
@@ -61,6 +68,8 @@ public static class PackageTypeHelper
                packageType.Equals("Patterns", StringComparison.OrdinalIgnoreCase);
     }
 
+    // The game only reads lots, Sims and worlds from its own folders, never through Resource.cfg,
+    // so they are never merged into a cache or stored in a vault shard.
     public static bool IsLibraryOnlyType(string? packageType)
     {
         if (string.IsNullOrWhiteSpace(packageType)) return false;
