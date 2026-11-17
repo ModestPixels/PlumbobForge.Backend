@@ -132,6 +132,10 @@ public class PackageConflictItem
     public string? PackageType { get; set; }
     public bool IsEnabled { get; set; } = true;
     public bool IsWinningInLoadOrder { get; set; }
+    // False when the active configuration doesn't load this item at all (its set is off, it is excluded, or it isn't in the library database).
+    public bool IsLoadedByConfiguration { get; set; } = true;
+    // Position in the game's load order; the lowest loaded rank is the copy the game uses (the first copy wins).
+    public int LoadRank { get; set; } = int.MaxValue;
 }
 
 public class ConflictCardModel

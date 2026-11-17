@@ -326,6 +326,8 @@ public class Sims3HealthService
         public bool IsEnabled;
         public int ResourceCount;
         public ulong ContentChecksum;
+        public bool IsLoaded;
+        public int LoadRank;
     }
 
     private static bool TryReadPackageIndexFast(
@@ -457,7 +459,8 @@ public class Sims3HealthService
             var summary = new HealthScanSummary();
             string libraryDir = Options.ManagedPackageFolderPath;
 
-            if (string.IsNullOrEmpty(libraryDir) || !Directory.Exists(libraryDir))
+            bool vaultMode = Options.EnableSingleSourceVault;
+            if (!vaultMode && (string.IsNullOrEmpty(libraryDir) || !Directory.Exists(libraryDir)))
             {
                 return summary;
             }
@@ -470,112 +473,169 @@ public class Sims3HealthService
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
 
+            // Different mods may share a file name in different library sub-folders, so match the full path first.
+            var metaByPath = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
             var metaMap = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
             foreach (var meta in metaEntities)
             {
+                string? fullPath = TryGetFullPath(meta.CompleteFileName);
+                if (fullPath != null) metaByPath.TryAdd(fullPath, meta);
                 if (!string.IsNullOrEmpty(meta.FileName) && !metaMap.ContainsKey(meta.FileName))
                 {
                     metaMap[meta.FileName] = meta;
                 }
             }
+            var scope = await ConfigurationScope.LoadActiveAsync(_db);
+            if (scope.SetIds.Count == 0 && scope.Overrides.Count == 0 && !Options.EnableSingleSourceVault &&
+                string.Equals(Options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase))
+            {
+                // With no active configuration the static cache holds the default sets.
+                var defaultSetIds = await _db.SetsEntities.Where(s => s.IsDefault).Select(s => s.Id).ToListAsync(cancellationToken);
+                scope = new ConfigurationScope(defaultSetIds.ToHashSet(), new Dictionary<long, bool>());
+            }
 
-            // 2. Discover package files in Library directory
-            var diskFiles = Directory.GetFiles(libraryDir, "*.package", SearchOption.AllDirectories)
-                .Where(f => !Path.GetFileName(f).StartsWith("._", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            summary.TotalPackagesScanned = diskFiles.Count;
-            progress?.CompleteStep("fetch_db", finalBadge: _localizer.GetString("progress.total_sets_packages_badge", 0, diskFiles.Count));
-
-            progress?.StartStep("scan_packages", _localizer.GetString("progress.scanning_conflicts_integrity"), badge: $"0/{diskFiles.Count}", progress: 0.0);
-
-            var packagesMeta = new CompactPackageMeta[diskFiles.Count];
-            var packageKeysList = new List<TGI_Key>[diskFiles.Count];
+            CompactPackageMeta[] packagesMeta;
+            MetaEntity?[] packageEntities;
+            List<TGI_Key>[] packageKeysList;
             var corruptCards = new ConcurrentBag<ConflictCardModel>();
+            int total;
 
-            int scannedCount = 0;
-            int total = diskFiles.Count;
-
-            var parallelOptions = new ParallelOptions
+            if (vaultMode)
             {
-                MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 1, 8),
-                CancellationToken = cancellationToken
-            };
-
-            Parallel.For(0, diskFiles.Count, parallelOptions, i =>
+                // Vault items live in shards, not library files: their resource keys come from the vault index.
+                (packagesMeta, packageEntities, packageKeysList) = await LoadVaultPackagesAsync(metaEntities, scope, cancellationToken);
+                total = packagesMeta.Length;
+                summary.TotalPackagesScanned = total;
+                progress?.CompleteStep("fetch_db", finalBadge: _localizer.GetString("progress.total_sets_packages_badge", 0, total));
+                progress?.StartStep("scan_packages", _localizer.GetString("progress.scanning_conflicts_integrity"), badge: $"{total}/{total}", progress: 1.0);
+            }
+            else
             {
-                if (cancellationToken.IsCancellationRequested) return;
+                // 2. Discover package files in Library directory
+                var diskFiles = Directory.GetFiles(libraryDir, "*.package", SearchOption.AllDirectories)
+                    .Where(f => !Path.GetFileName(f).StartsWith("._", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
-                int current = Interlocked.Increment(ref scannedCount);
-                if (current % 100 == 0 || current == total)
+                summary.TotalPackagesScanned = diskFiles.Count;
+                progress?.CompleteStep("fetch_db", finalBadge: _localizer.GetString("progress.total_sets_packages_badge", 0, diskFiles.Count));
+
+                progress?.StartStep("scan_packages", _localizer.GetString("progress.scanning_conflicts_integrity"), badge: $"0/{diskFiles.Count}", progress: 0.0);
+
+                packagesMeta = new CompactPackageMeta[diskFiles.Count];
+                packageEntities = new MetaEntity?[diskFiles.Count];
+                packageKeysList = new List<TGI_Key>[diskFiles.Count];
+
+                int scannedCount = 0;
+                total = diskFiles.Count;
+
+                var parallelOptions = new ParallelOptions
                 {
-                    double pct = (double)current / total;
-                    progress?.UpdateStep("scan_packages", badge: $"{current}/{total}", progress: pct);
-                }
+                    MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 1, 8),
+                    CancellationToken = cancellationToken
+                };
 
-                string filePath = diskFiles[i];
-                string fileName = Path.GetFileName(filePath);
-                metaMap.TryGetValue(fileName, out var meta);
-
-                string setName = meta?.SetsEntity?.Name ?? "Uncategorized";
-                long? setId = meta?.SetsEntityId;
-                long? metaId = meta?.Id;
-                string? packageType = meta?.PackageType;
-                bool isEnabled = meta?.Enabled ?? true;
-
-                if (!TryReadPackageIndexFast(filePath, out var keys, out ulong checksum, out string? error))
+                Parallel.For(0, diskFiles.Count, parallelOptions, i =>
                 {
-                    bool isS2 = error?.Contains("Sims 2") == true;
-                    var corruptPkg = new PackageConflictItem
+                    if (cancellationToken.IsCancellationRequested) return;
+
+                    int current = Interlocked.Increment(ref scannedCount);
+                    if (current % 100 == 0 || current == total)
                     {
-                        PackageFileName = fileName,
-                        PackagePath = filePath,
+                        double pct = (double)current / total;
+                        progress?.UpdateStep("scan_packages", badge: $"{current}/{total}", progress: pct);
+                    }
+
+                    string filePath = diskFiles[i];
+                    string fileName = Path.GetFileName(filePath);
+                    string? diskFullPath = TryGetFullPath(filePath);
+                    MetaEntity? meta = null;
+                    if (diskFullPath == null || !metaByPath.TryGetValue(diskFullPath, out meta))
+                    {
+                        metaMap.TryGetValue(fileName, out meta);
+                    }
+                    packageEntities[i] = meta;
+                    // Whether the active configuration loads the item when it is enabled. Library files missing from the
+                    // database are never deployed.
+                    bool isLoaded = meta != null && scope.Includes(meta);
+
+                    string setName = meta?.SetsEntity?.Name ?? "Uncategorized";
+                    long? setId = meta?.SetsEntityId;
+                    long? metaId = meta?.Id;
+                    string? packageType = meta?.PackageType;
+                    bool isEnabled = meta?.Enabled ?? true;
+
+                    if (!TryReadPackageIndexFast(filePath, out var keys, out ulong checksum, out string? error))
+                    {
+                        bool isS2 = error?.Contains("Sims 2") == true;
+                        var corruptPkg = new PackageConflictItem
+                        {
+                            PackageFileName = fileName,
+                            PackagePath = filePath,
+                            SetName = setName,
+                            SetId = setId,
+                            MetaEntityId = metaId,
+                            PackageType = packageType,
+                            IsEnabled = isEnabled,
+                            IsLoadedByConfiguration = isLoaded,
+                            IsWinningInLoadOrder = isEnabled && isLoaded
+                        };
+                        corruptCards.Add(new ConflictCardModel
+                        {
+                            Category = ConflictCardCategory.CorruptFile,
+                            Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
+                            Explanation = isS2
+                                ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
+                                : (error ?? "Package header is broken or truncated and cannot be read by the game."),
+                            Recommendation = "We recommend disabling or deleting this file from your library.",
+                            Packages = new List<PackageConflictItem> { corruptPkg },
+                            ConflictFingerprint = $"Corrupt:{fileName.ToLowerInvariant()}",
+                            TechnicalDetails = new List<string> { error ?? "DBPF format error" }
+                        });
+                        return;
+                    }
+
+                    packagesMeta[i] = new CompactPackageMeta
+                    {
+                        Id = i,
+                        FileName = fileName,
+                        FilePath = filePath,
                         SetName = setName,
                         SetId = setId,
                         MetaEntityId = metaId,
                         PackageType = packageType,
                         IsEnabled = isEnabled,
-                        IsWinningInLoadOrder = isEnabled
+                        ResourceCount = keys.Count,
+                        ContentChecksum = checksum,
+                        IsLoaded = isLoaded,
+                        LoadRank = int.MaxValue
                     };
-                    corruptCards.Add(new ConflictCardModel
-                    {
-                        Category = ConflictCardCategory.CorruptFile,
-                        Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
-                        Explanation = isS2
-                            ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
-                            : (error ?? "Package header is broken or truncated and cannot be read by the game."),
-                        Recommendation = "We recommend disabling or deleting this file from your library.",
-                        Packages = new List<PackageConflictItem> { corruptPkg },
-                        ConflictFingerprint = $"Corrupt:{fileName.ToLowerInvariant()}",
-                        TechnicalDetails = new List<string> { error ?? "DBPF format error" }
-                    });
-                    return;
-                }
 
-                packagesMeta[i] = new CompactPackageMeta
-                {
-                    Id = i,
-                    FileName = fileName,
-                    FilePath = filePath,
-                    SetName = setName,
-                    SetId = setId,
-                    MetaEntityId = metaId,
-                    PackageType = packageType,
-                    IsEnabled = isEnabled,
-                    ResourceCount = keys.Count,
-                    ContentChecksum = checksum
-                };
-
-                packageKeysList[i] = keys;
-            });
+                    packageKeysList[i] = keys;
+                });
+            }
 
             progress?.CompleteStep("scan_packages", finalBadge: _localizer.GetString("progress.items_merged_badge", total, total));
             progress?.StartStep("analyze_conflicts", _localizer.GetString("progress.grouping_problems"), badge: null, progress: 0.0);
 
+            await AssignLoadRanksAsync(packagesMeta, packageEntities, scope);
+
+            PackageConflictItem ToConflictItem(CompactPackageMeta p) => new()
+            {
+                PackageFileName = p.FileName,
+                PackagePath = p.FilePath,
+                SetName = p.SetName,
+                SetId = p.SetId,
+                MetaEntityId = p.MetaEntityId,
+                PackageType = p.PackageType,
+                IsEnabled = p.IsEnabled,
+                IsLoadedByConfiguration = p.IsLoaded,
+                LoadRank = p.LoadRank
+            };
+
             // 3. Inverted Index: TGI_Key -> List of package IDs
             var resourceMap = new Dictionary<TGI_Key, List<int>>();
-            for (int i = 0; i < diskFiles.Count; i++)
+            for (int i = 0; i < packagesMeta.Length; i++)
             {
                 var keys = packageKeysList[i];
                 if (keys == null || keys.Count == 0) continue;
@@ -621,16 +681,7 @@ public class Sims3HealthService
                 string setName = groupList[0].SetName;
                 var samplePkg = groupList[0];
 
-                var pkgItems = groupList.Select(p => new PackageConflictItem
-                {
-                    PackageFileName = p.FileName,
-                    PackagePath = p.FilePath,
-                    SetName = p.SetName,
-                    SetId = p.SetId,
-                    MetaEntityId = p.MetaEntityId,
-                    PackageType = p.PackageType,
-                    IsEnabled = p.IsEnabled
-                }).ToList();
+                var pkgItems = groupList.Select(ToConflictItem).ToList();
 
                 ComputeLoadOrderWinners(pkgItems);
 
@@ -708,16 +759,7 @@ public class Sims3HealthService
                     .ToList();
                 string tuningSummary = string.Join(", ", distinctTuningNames);
 
-                var pkgItems = clusterPkgs.Select(p => new PackageConflictItem
-                {
-                    PackageFileName = p.FileName,
-                    PackagePath = p.FilePath,
-                    SetName = p.SetName,
-                    SetId = p.SetId,
-                    MetaEntityId = p.MetaEntityId,
-                    PackageType = p.PackageType,
-                    IsEnabled = p.IsEnabled
-                }).ToList();
+                var pkgItems = clusterPkgs.Select(ToConflictItem).ToList();
 
                 ComputeLoadOrderWinners(pkgItems);
 
@@ -799,16 +841,7 @@ public class Sims3HealthService
                     .ToList();
                 string overrideSummary = string.Join(", ", distinctOverrideNames);
 
-                var pkgItems = clusterPkgs.Select(p => new PackageConflictItem
-                {
-                    PackageFileName = p.FileName,
-                    PackagePath = p.FilePath,
-                    SetName = p.SetName,
-                    SetId = p.SetId,
-                    MetaEntityId = p.MetaEntityId,
-                    PackageType = p.PackageType,
-                    IsEnabled = p.IsEnabled
-                }).ToList();
+                var pkgItems = clusterPkgs.Select(ToConflictItem).ToList();
 
                 ComputeLoadOrderWinners(pkgItems);
 
@@ -823,7 +856,7 @@ public class Sims3HealthService
                     Title = isIntraSet
                         ? $"Resource Override ({clusterPkgs.Count} files in '{setName}')"
                         : $"Resource Override ({clusterPkgs.Count} files colliding)",
-                    Explanation = $"These packages contain the same {overrideSummary}. The package loaded last will override the earlier ones in game.",
+                    Explanation = $"These packages contain the same {overrideSummary}. Only one copy of each reaches the game: the package marked Active in Game.",
                     Recommendation = "Usually safe to keep if one is intended to replace or recolor the other (e.g. default skins, eyes, or mesh replacements).",
                     Packages = pkgItems,
                     AffectedResourceCount = cluster.Keys.Count,
@@ -861,22 +894,165 @@ public class Sims3HealthService
         }, cancellationToken);
     }
 
-        private static void ComputeLoadOrderWinners(List<PackageConflictItem> items)
+    // Only one copy of a resource reaches the game: caches and vault shards keep the first copy merged in, and between
+    // packages of the same priority the game keeps the first one it loads. So the lowest load rank wins, not the last.
+    public static void ComputeLoadOrderWinners(IEnumerable<PackageConflictItem> items)
     {
-        var enabledItems = items.Where(x => x.IsEnabled).ToList();
+        PackageConflictItem? winner = null;
         foreach (var item in items)
         {
             item.IsWinningInLoadOrder = false;
+            if (!item.IsEnabled || !item.IsLoadedByConfiguration) continue;
+            if (winner == null || item.LoadRank < winner.LoadRank) winner = item;
         }
 
-        if (enabledItems.Count == 0) return;
+        if (winner != null) winner.IsWinningInLoadOrder = true;
+    }
 
-        var winner = enabledItems
-            .OrderByDescending(p => p.PackagePath.Contains("overrides", StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(p => p.PackageFileName, StringComparer.OrdinalIgnoreCase)
-            .First();
+    // Ranks every package the active configuration loads in the order its copy of a shared resource would be kept,
+    // mirroring how CacheBuilderService and VaultService lay items out. Disabled items are ranked too, so a package
+    // switched on from the scanner lands in the right place.
+    private async Task AssignLoadRanksAsync(CompactPackageMeta[] packages, MetaEntity?[] entities, ConfigurationScope scope)
+    {
+        var included = Enumerable.Range(0, packages.Length)
+            .Where(i => packages[i].IsLoaded && entities[i] != null)
+            .ToList();
+        if (included.Count == 0) return;
 
-        winner.IsWinningInLoadOrder = true;
+        IOrderedEnumerable<int> ordered;
+        if (Options.EnableSingleSourceVault)
+        {
+            // Resource.cfg lists the shard folders alphabetically; inside a shard the item imported first wins.
+            var shardPaths = new Dictionary<long, string>();
+            try
+            {
+                string vaultRoot = VaultService.GetVaultRootDirectory(_cacheBuilderService.GetSims3FolderPath());
+                var shards = await _db.VaultShards.AsNoTracking().Include(s => s.SetsEntity).ToListAsync();
+                foreach (var shard in shards)
+                {
+                    shardPaths[shard.Id] = VaultService.ResolveShardPath(vaultRoot, shard, shard.SetsEntity);
+                }
+            }
+            catch
+            {
+                // Without shard paths the item order inside the vault still decides.
+            }
+
+            string ShardPath(int i) =>
+                entities[i]!.VaultShardId is long id && shardPaths.TryGetValue(id, out var path) ? path : string.Empty;
+
+            ordered = included
+                .OrderBy(i => ShardPath(i).Length == 0 ? 1 : 0)
+                .ThenBy(ShardPath, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(i => ConfigurationScope.TopLevelId(entities[i]!))
+                .ThenBy(i => entities[i]!.Id);
+        }
+        else
+        {
+            // Same sort as the cache merge (first copy kept). Dynamic mode builds one cache per set, listed in
+            // Resource.cfg by set id, with the configuration item cache last; static mode merges everything into one.
+            bool isStatic = string.Equals(Options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
+            long FolderOrder(MetaEntity m)
+            {
+                if (isStatic) return 0;
+                bool inSetCache = !m.ExcludedByAnyConfig && m.SetsEntityId is long setId && scope.SetIds.Contains(setId);
+                return inSetCache ? m.SetsEntityId!.Value : long.MaxValue;
+            }
+
+            ordered = included
+                .OrderBy(i => FolderOrder(entities[i]!))
+                .ThenBy(i => CacheBuilderService.GetPackageTypePriority(entities[i]!.PackageType))
+                .ThenBy(i => entities[i]!.PackageType)
+                .ThenBy(i => entities[i]!.FileName)
+                .ThenBy(i => entities[i]!.Id);
+        }
+
+        int rank = 0;
+        foreach (int i in ordered)
+        {
+            packages[i].LoadRank = rank++;
+        }
+    }
+
+    // Vault mode: one entry per library item, with the resource keys its shard chunks hold. A Sims3Pack's parts count
+    // as their parent item, which is what the library shows and what enabling or disabling acts on. Resources the
+    // vault never indexes (manifests, objects switched off in Look Inside) are left out, as the game never sees them.
+    private async Task<(CompactPackageMeta[] Packages, MetaEntity?[] Entities, List<TGI_Key>[] Keys)> LoadVaultPackagesAsync(
+        List<MetaEntity> metaEntities, ConfigurationScope scope, CancellationToken cancellationToken)
+    {
+        var metaById = metaEntities.ToDictionary(m => m.Id);
+        var chunks = await _db.VaultChunks.AsNoTracking()
+            .Select(c => new { c.MetaEntityId, c.Type, c.Group, c.Instance })
+            .ToListAsync(cancellationToken);
+        var disabled = (await _db.DisabledObjects.AsNoTracking()
+                .Select(d => new { d.MetaEntityId, d.Type, d.Group, d.Instance })
+                .ToListAsync(cancellationToken))
+            .Select(d => (d.MetaEntityId, d.Type, d.Group, d.Instance))
+            .ToHashSet();
+
+        var keysByItem = new Dictionary<long, HashSet<TGI_Key>>();
+        foreach (var c in chunks)
+        {
+            if (!metaById.TryGetValue(c.MetaEntityId, out var holder)) continue;
+            long itemId = ConfigurationScope.TopLevelId(holder);
+            if (!metaById.ContainsKey(itemId)) continue;
+            if (!CacheContentRules.IsLoadableType(c.Type) || Sims3ResourceTags.IsBenignRepeatingResource(c.Type)) continue;
+            if (disabled.Contains((itemId, c.Type, c.Group, c.Instance))) continue;
+
+            if (!keysByItem.TryGetValue(itemId, out var keySet))
+            {
+                keySet = new HashSet<TGI_Key>();
+                keysByItem[itemId] = keySet;
+            }
+            keySet.Add(new TGI_Key(c.Type, c.Group, c.Instance));
+        }
+
+        var items = keysByItem.Keys
+            .Select(id => metaById[id])
+            .OrderBy(m => m.FileName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.Id)
+            .ToList();
+
+        var packages = new CompactPackageMeta[items.Count];
+        var entities = new MetaEntity?[items.Count];
+        var keyLists = new List<TGI_Key>[items.Count];
+        for (int i = 0; i < items.Count; i++)
+        {
+            var meta = items[i];
+            var keys = keysByItem[meta.Id].ToList();
+            ulong checksum = 0;
+            foreach (var key in keys)
+            {
+                checksum ^= (ulong)key.Type ^ ((ulong)key.Group << 16) ^ key.Instance;
+            }
+
+            packages[i] = new CompactPackageMeta
+            {
+                Id = i,
+                FileName = meta.FileName,
+                FilePath = meta.CompleteFileName,
+                SetName = meta.SetsEntity?.Name ?? "Uncategorized",
+                SetId = meta.SetsEntityId,
+                MetaEntityId = meta.Id,
+                PackageType = meta.PackageType,
+                IsEnabled = meta.Enabled,
+                ResourceCount = keys.Count,
+                ContentChecksum = checksum,
+                IsLoaded = scope.Includes(meta),
+                LoadRank = int.MaxValue
+            };
+            entities[i] = meta;
+            keyLists[i] = keys;
+        }
+
+        return (packages, entities, keyLists);
+    }
+
+    private static string? TryGetFullPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        try { return Path.GetFullPath(path); }
+        catch { return null; }
     }
 
     private class DisjointSet

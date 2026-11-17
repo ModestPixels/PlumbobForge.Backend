@@ -67,7 +67,8 @@ public class CacheBuilderService
         return SpecialPackageType.None;
     }
 
-    private static int GetPackageTypePriority(string? packageType)
+    // The conflict scanner orders items the same way to tell which copy of a resource the game ends up using.
+    internal static int GetPackageTypePriority(string? packageType)
     {
         if (string.IsNullOrEmpty(packageType)) return 4;
         // Group CAS items together first so StaticBundle_0 holds CAS items for fast CAS loading
