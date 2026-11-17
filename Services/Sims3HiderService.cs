@@ -14,6 +14,7 @@ using PlumbobForge.Backend.Database;
 using S3ForgeTools.GameFiles.Package;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils.Logging;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -68,7 +69,7 @@ public class Sims3HiderService
             string path = GetHiderPackagePath(collectionId);
             if (File.Exists(path))
             {
-                File.Delete(path);
+                WritableFile.Delete(path);
                 log.Info($"Deleted hider package '{path}'");
                 return true;
             }
@@ -245,7 +246,7 @@ public class Sims3HiderService
         string tempFile = targetPath + ".tmp";
         try
         {
-            if (File.Exists(tempFile)) File.Delete(tempFile);
+            if (File.Exists(tempFile)) WritableFile.Delete(tempFile);
 
             using (var builder = new DBPFPackageBuilder(tempFile, false))
             {
@@ -257,7 +258,7 @@ public class Sims3HiderService
                 }
             }
 
-            if (File.Exists(targetPath)) File.Delete(targetPath);
+            if (File.Exists(targetPath)) WritableFile.Delete(targetPath);
             File.Move(tempFile, targetPath);
 
             result.Success = true;
@@ -270,7 +271,7 @@ public class Sims3HiderService
         }
         finally
         {
-            try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            try { if (File.Exists(tempFile)) WritableFile.Delete(tempFile); } catch { }
         }
 
         return result;

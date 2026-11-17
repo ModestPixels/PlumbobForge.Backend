@@ -7,6 +7,7 @@ using PlumbobForge.Backend.Database;
 using Microsoft.Extensions.Options;
 using SharpCompress.Archives;
 using SharpCompress.Common;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -86,7 +87,7 @@ public class ArchiveService
 
         if (string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase))
         {
-            try { File.Delete(destPath); } catch { }
+            try { WritableFile.Delete(destPath); } catch { }
             onMarkDirty?.Invoke(fileName);
             return (destPath, false);
         }
@@ -149,6 +150,7 @@ public class ArchiveService
                     continue;
                 }
 
+                WritableFile.Prepare(destPath);
                 entry.WriteToFile(destPath, new ExtractionOptions { ExtractFullPath = false, Overwrite = true });
                 extractedPaths.Add(destPath);
                 onProgress?.Invoke($"Extracted from archive: {fileName}");

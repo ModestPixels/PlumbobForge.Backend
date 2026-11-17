@@ -178,7 +178,7 @@ public class PKGManager
                     continue;
                 }
 
-                File.Copy(filePath, destPath, overwrite: true);
+                WritableFile.Copy(filePath, destPath);
                 importedPaths.Add(destPath);
                 onProgress?.Invoke($"Imported file: {fileName}");
             }
@@ -237,7 +237,7 @@ public class PKGManager
                     string fileDir = Path.Combine(stagingDir, Guid.NewGuid().ToString("N"));
                     Directory.CreateDirectory(fileDir);
                     string staged = Path.Combine(fileDir, Path.GetFileName(filePath));
-                    File.Copy(filePath, staged, overwrite: true);
+                    WritableFile.Copy(filePath, staged);
                     stagedFiles.Add(staged);
                 }
             }
@@ -280,7 +280,7 @@ public class PKGManager
                     bool replaceExisting = duplicate && string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase);
                     var (destPath, shouldSkip) = ArchiveService.ResolveDestinationPath(_options.ManagedPackageFolderPath, fileName, replaceExisting ? "replace" : "rename");
                     if (shouldSkip || destPath == null) continue;
-                    File.Move(path, destPath, overwrite: true);
+                    WritableFile.Move(path, destPath, overwrite: true);
                     path = destPath;
                 }
                 toRegister.Add(path);
@@ -304,7 +304,7 @@ public class PKGManager
         }
         finally
         {
-            try { Directory.Delete(stagingDir, true); } catch { }
+            try { WritableFile.DeleteDirectory(stagingDir); } catch { }
         }
     }
 
@@ -401,7 +401,7 @@ public class PKGManager
 
                             result.Add(imported);
                             existingMetas[fileName] = imported;
-                            try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
+                            try { if (File.Exists(filePath)) WritableFile.Delete(filePath); } catch { }
                         }
                     }
                     catch (Exception ex)
@@ -473,7 +473,7 @@ public class PKGManager
 
                     if (replaced)
                     {
-                        try { File.Delete(filePath); } catch { }
+                        try { WritableFile.Delete(filePath); } catch { }
                         result.Add(existingMeta);
                     }
                     else
@@ -629,7 +629,7 @@ public class PKGManager
                 {
                     importedCount += importedMetas.Count;
                     // ImportFilesAsync works on a copy; remove the original so it is not imported again next time.
-                    try { File.Delete(file); } catch { }
+                    try { WritableFile.Delete(file); } catch { }
                 }
                 continue;
             }
@@ -639,7 +639,7 @@ public class PKGManager
                 var extracted = ExtractPackagesFromArchive(file, _options.ManagedPackageFolderPath, duplicateAction, onProgress);
                 if (extracted.Count > 0)
                 {
-                    try { File.Delete(file); } catch { }
+                    try { WritableFile.Delete(file); } catch { }
                     importedCount += extracted.Count;
                 }
             }
@@ -656,7 +656,7 @@ public class PKGManager
 
                 try
                 {
-                    File.Move(file, destPath, overwrite: true);
+                    WritableFile.Move(file, destPath, overwrite: true);
                     importedCount++;
                     onProgress?.Invoke($"Moved to Library: {fileName}");
                 }

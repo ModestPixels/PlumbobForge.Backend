@@ -12,6 +12,7 @@ using S3ForgeTools.GameFiles.Package;
 using S3ForgeTools.GameFiles.Textures;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils.Logging;
+using S3ForgeTools.Utils;
 
 #nullable enable
 namespace PlumbobForge.Backend.Services;
@@ -603,7 +604,7 @@ public class VaultService
         // Delete source package only after commit
         try
         {
-            File.Delete(packageFilePath);
+            WritableFile.Delete(packageFilePath);
         }
         catch (Exception ex)
         {
@@ -789,7 +790,7 @@ public class VaultService
             try
             {
                 s3p.Dispose();
-                File.Delete(sims3PackPath);
+                WritableFile.Delete(sims3PackPath);
             }
             catch (Exception ex)
             {
@@ -1014,7 +1015,7 @@ public class VaultService
             try
             {
                 if (removeLibraryFile != null) removeLibraryFile(path);
-                else File.Delete(path);
+                else WritableFile.Delete(path);
             }
             catch (Exception ex)
             {
@@ -1047,7 +1048,7 @@ public class VaultService
             string path = GetShardFullPath(shard);
             try
             {
-                if (File.Exists(path)) File.Delete(path);
+                if (File.Exists(path)) WritableFile.Delete(path);
                 _db.VaultShards.Remove(shard);
             }
             catch (Exception ex)
@@ -1242,11 +1243,11 @@ public class VaultService
             {
                 DBPFVaultShard.ExportStandalonePackage(shardPath, entries, fs);
             }
-            File.Move(tempPath, destinationFilePath, overwrite: true);
+            WritableFile.Move(tempPath, destinationFilePath, overwrite: true);
         }
         finally
         {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            try { if (File.Exists(tempPath)) WritableFile.Delete(tempPath); } catch { }
         }
         return true;
     }
@@ -1275,7 +1276,7 @@ public class VaultService
         {
             if (File.Exists(meta.CompleteFileName))
             {
-                File.Copy(meta.CompleteFileName, destinationFilePath, true);
+                WritableFile.Copy(meta.CompleteFileName, destinationFilePath);
                 return true;
             }
             return false;
@@ -1302,7 +1303,7 @@ public class VaultService
         foreach (var part in libraryParts)
         {
             if (!File.Exists(part.CompleteFileName)) continue;
-            File.Copy(part.CompleteFileName, Path.Combine(dir ?? "", part.FileName), true);
+            WritableFile.Copy(part.CompleteFileName, Path.Combine(dir ?? "", part.FileName));
             any = true;
         }
 
@@ -1469,7 +1470,7 @@ public class VaultService
 
         foreach (var path in oldLibraryFiles)
         {
-            try { if (File.Exists(path)) File.Delete(path); }
+            try { if (File.Exists(path)) WritableFile.Delete(path); }
             catch (Exception ex) { log.Warn($"Could not delete replaced library part {path}: {ex.Message}"); }
         }
         if (oldLibraryFiles.Count > 0 || newLibraryChildren.Count > 0) await _cacheBuilderService.SyncToSims3Async();
@@ -2011,7 +2012,7 @@ public class VaultService
             try
             {
                 string tempPath = fullPath + DBPFVaultShard.CompactionTempSuffix;
-                if (File.Exists(tempPath)) File.Delete(tempPath);
+                if (File.Exists(tempPath)) WritableFile.Delete(tempPath);
 
                 if (File.Exists(fullPath + DBPFVaultShard.CompactionBackupSuffix))
                 {

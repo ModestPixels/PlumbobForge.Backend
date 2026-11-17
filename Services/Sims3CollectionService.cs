@@ -16,6 +16,7 @@ using S3ForgeTools.GameFiles.Package;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils.Logging;
 using SkiaSharp;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -645,7 +646,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
         {
             await Task.Run(() =>
             {
-                if (File.Exists(tempFile)) File.Delete(tempFile);
+                if (File.Exists(tempFile)) WritableFile.Delete(tempFile);
 
                 // Encode 0x0C07456D (201803117u) binary resource
                 byte[] resourceBytes;
@@ -686,7 +687,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
                     }
                 }
 
-                if (File.Exists(targetPath)) File.Delete(targetPath);
+                if (File.Exists(targetPath)) WritableFile.Delete(targetPath);
                 File.Move(tempFile, targetPath);
             }, cancellationToken);
 
@@ -762,7 +763,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
             result.ErrorMessage = $"Failed to write collection package: {ex.Message}";
             if (File.Exists(tempFile))
             {
-                try { File.Delete(tempFile); } catch { }
+                try { WritableFile.Delete(tempFile); } catch { }
             }
         }
 
@@ -779,13 +780,13 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
 
             if (File.Exists(filePath))
             {
-                File.Delete(filePath);
+                WritableFile.Delete(filePath);
             }
 
             string sigPath = filePath + ".sig";
             if (File.Exists(sigPath))
             {
-                try { File.Delete(sigPath); } catch { }
+                try { WritableFile.Delete(sigPath); } catch { }
             }
 
             // Remove associated hider package
@@ -1197,7 +1198,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
                 var files = Directory.GetFiles(dir, $"0x{instanceId:x16}*.png");
                 foreach (var f in files)
                 {
-                    try { File.Delete(f); } catch { }
+                    try { WritableFile.Delete(f); } catch { }
                 }
             }
 
@@ -1254,7 +1255,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
                 {
                     if (File.Exists(packagePath))
                     {
-                        try { File.Delete(packagePath); } catch { }
+                        try { WritableFile.Delete(packagePath); } catch { }
                     }
                     return;
                 }
@@ -1265,7 +1266,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
                 }
 
                 string tempFile = packagePath + ".tmp";
-                if (File.Exists(tempFile)) File.Delete(tempFile);
+                if (File.Exists(tempFile)) WritableFile.Delete(tempFile);
 
                 using (var builder = new DBPFPackageBuilder(tempFile, false))
                 {
@@ -1279,7 +1280,7 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
                     }
                 }
 
-                if (File.Exists(packagePath)) File.Delete(packagePath);
+                if (File.Exists(packagePath)) WritableFile.Delete(packagePath);
                 File.Move(tempFile, packagePath);
             }
             catch (Exception ex)

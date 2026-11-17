@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -94,7 +95,7 @@ public static class Sims3GameProcess
             string path = Path.Combine(sims3UserDir, name);
             try
             {
-                if (File.Exists(path)) File.Delete(path);
+                if (File.Exists(path)) WritableFile.Delete(path);
             }
             catch
             {
@@ -110,7 +111,7 @@ public static class Sims3GameProcess
         try
         {
             Directory.CreateDirectory(appDataDir);
-            File.WriteAllText(GetPendingFlagPath(appDataDir), DateTime.UtcNow.ToString("O"));
+            WritableFile.WriteAllText(GetPendingFlagPath(appDataDir), DateTime.UtcNow.ToString("O"));
         }
         catch { }
     }
@@ -121,7 +122,7 @@ public static class Sims3GameProcess
         try
         {
             string flag = GetPendingFlagPath(appDataDir);
-            if (File.Exists(flag)) File.Delete(flag);
+            if (File.Exists(flag)) WritableFile.Delete(flag);
         }
         catch { }
     }

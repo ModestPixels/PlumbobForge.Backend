@@ -12,6 +12,7 @@ using Microsoft.Extensions.Options;
 using PlumbobForge.Backend.Configuration;
 using PlumbobForge.Backend.Database;
 using S3ForgeTools.GameFiles.Package;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -79,7 +80,7 @@ public class MigrationService
         foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
         {
             if (keep.Contains(Path.GetFullPath(file))) continue;
-            try { File.Delete(file); } catch { }
+            try { WritableFile.Delete(file); } catch { }
         }
         DeleteEmptySubdirectories(dir);
     }
@@ -313,7 +314,7 @@ public class MigrationService
                         try
                         {
                             Directory.CreateDirectory(Path.GetDirectoryName(keep)!);
-                            if (File.Exists(moved)) File.Copy(moved, keep, overwrite: true);
+                            if (File.Exists(moved)) WritableFile.Copy(moved, keep);
                         }
                         catch (Exception ex)
                         {
@@ -359,7 +360,7 @@ public class MigrationService
                     {
                         var fi = new FileInfo(oldPkg);
                         totalBytesReclaimed += fi.Length;
-                        fi.Delete();
+                        WritableFile.Delete(oldPkg);
                     }
                     catch { }
                 }
@@ -369,7 +370,7 @@ public class MigrationService
                     string dirName = Path.GetFileName(dir);
                     if (!dirName.Equals("Config", StringComparison.OrdinalIgnoreCase))
                     {
-                        try { Directory.Delete(dir, true); } catch { }
+                        try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
                 }
 
@@ -425,7 +426,7 @@ public class MigrationService
         {
             string path = libraryPaths[id];
             if (!IsUnderDirectory(path, _options.ManagedPackageFolderPath)) continue;
-            try { if (File.Exists(path)) File.Delete(path); }
+            try { if (File.Exists(path)) WritableFile.Delete(path); }
             catch (Exception ex) { onProgress?.Invoke($"Could not delete migrated library file {path}: {ex.Message}"); }
         }
 
@@ -511,7 +512,7 @@ public class MigrationService
                     if (!intoLibrary)
                     {
                         Directory.CreateDirectory(targetDir);
-                        File.Copy(part.CompleteFileName, Path.Combine(targetDir, part.FileName), overwrite: true);
+                        WritableFile.Copy(part.CompleteFileName, Path.Combine(targetDir, part.FileName));
                     }
                     exported++;
                     plan.StandaloneChildren[part.Id] = meta.Id;
@@ -580,7 +581,7 @@ public class MigrationService
                 string? destSubDir = Path.GetDirectoryName(destFile);
                 if (!string.IsNullOrEmpty(destSubDir)) Directory.CreateDirectory(destSubDir);
 
-                File.Copy(file, destFile, overwrite: true);
+                WritableFile.Copy(file, destFile);
                 restoredCount++;
                 fileIdx++;
                 if (fileIdx % 20 == 0 || fileIdx == backupFiles.Length)
@@ -624,6 +625,7 @@ public class MigrationService
                     string? destSubDir = Path.GetDirectoryName(destFile);
                     if (!string.IsNullOrEmpty(destSubDir)) Directory.CreateDirectory(destSubDir);
 
+                    WritableFile.Prepare(destFile);
                     entry.ExtractToFile(destFile, overwrite: true);
                     restoredCount++;
                     if (entryIdx % 20 == 0 || entryIdx == totalEntries)
@@ -837,7 +839,7 @@ public class MigrationService
 
         foreach (var path in libraryFilesToRemove)
         {
-            try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path); }
+            try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) WritableFile.Delete(path); }
             catch (Exception ex) { onProgress?.Invoke($"Could not remove {Path.GetFileName(path)}: {ex.Message}"); }
         }
 
@@ -896,7 +898,7 @@ public class MigrationService
             string backupDir = libraryDir + "_Backup";
             if (Directory.Exists(backupDir))
             {
-                try { Directory.Delete(backupDir, true); } catch { }
+                try { WritableFile.DeleteDirectory(backupDir); } catch { }
             }
         }
 
@@ -978,7 +980,7 @@ public class MigrationService
             var dest = Path.Combine(libraryPath, Path.GetFileName(file));
             if (!string.Equals(file, dest, StringComparison.OrdinalIgnoreCase) && !File.Exists(dest))
             {
-                File.Copy(file, dest, overwrite: true);
+                WritableFile.Copy(file, dest);
             }
         }
 
@@ -1273,7 +1275,7 @@ public class MigrationService
             var dest = Path.Combine(libraryPath, fileName);
             if (!string.Equals(file, dest, StringComparison.OrdinalIgnoreCase) && !File.Exists(dest))
             {
-                File.Copy(file, dest, overwrite: true);
+                WritableFile.Copy(file, dest);
                 packagesMigrated++;
             }
 
@@ -1466,7 +1468,7 @@ public class MigrationService
             var dest = Path.Combine(libraryPath, Path.GetFileName(file));
             if (!string.Equals(file, dest, StringComparison.OrdinalIgnoreCase) && !File.Exists(dest))
             {
-                File.Copy(file, dest, overwrite: true);
+                WritableFile.Copy(file, dest);
             }
         }
 
@@ -1574,7 +1576,7 @@ public class MigrationService
                     string destPath = Path.Combine(libraryPath, fileName);
                     if (!string.Equals(pkgFile, destPath, StringComparison.OrdinalIgnoreCase) && !File.Exists(destPath))
                     {
-                        File.Copy(pkgFile, destPath, overwrite: true);
+                        WritableFile.Copy(pkgFile, destPath);
                         totalPackagesMigrated++;
                     }
 

@@ -8,6 +8,7 @@ using PlumbobForge.Backend.Database;
 using S3ForgeTools.GameFiles.Package;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils.Logging;
+using S3ForgeTools.Utils;
 
 namespace PlumbobForge.Backend.Services;
 
@@ -126,7 +127,7 @@ public class PackageEditService
         bool isSims3Pack = path.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
         string tempPath = path + ".pftmp";
         string backupPath = path + ".pfbak";
-        if (File.Exists(tempPath)) File.Delete(tempPath);
+        if (File.Exists(tempPath)) WritableFile.Delete(tempPath);
         // A leftover backup exists only when an earlier edit could not recycle it, so it is the only copy of
         // that version: recycle it now, or keep it under another name.
         if (File.Exists(backupPath) && !RecycleBinHelper.SendToRecycleBin(backupPath))
@@ -161,7 +162,7 @@ public class PackageEditService
         }
         catch
         {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            try { if (File.Exists(tempPath)) WritableFile.Delete(tempPath); } catch { }
             throw;
         }
 

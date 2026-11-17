@@ -171,7 +171,7 @@ public class CacheBuilderService
                     if (!dirName.Equals("Config", StringComparison.OrdinalIgnoreCase) &&
                         !dirName.Equals("StaticCache", StringComparison.OrdinalIgnoreCase))
                     {
-                        try { Directory.Delete(dir, true); } catch { }
+                        try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
                 }
 
@@ -187,7 +187,7 @@ public class CacheBuilderService
                 // In Dynamic mode: Clean up StaticCache folder if it exists
                 if (Directory.Exists(staticCacheDir))
                 {
-                    try { Directory.Delete(staticCacheDir, true); } catch { }
+                    try { WritableFile.DeleteDirectory(staticCacheDir); } catch { }
                 }
 
                 // Clean up cache folders of deleted sets
@@ -212,7 +212,7 @@ public class CacheBuilderService
                     string dirName = Path.GetFileName(dir);
                     if (!allSetFolderNames.Contains(dirName))
                     {
-                        try { Directory.Delete(dir, true); } catch { }
+                        try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
                 }
             }
@@ -274,7 +274,7 @@ public class CacheBuilderService
                 {
                     if (File.Exists(oldFile))
                     {
-                        try { File.Delete(oldFile); } catch { }
+                        try { WritableFile.Delete(oldFile); } catch { }
                     }
                 }
             }
@@ -292,7 +292,7 @@ public class CacheBuilderService
                         Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
                         if (!File.Exists(destPath) || File.GetLastWriteTimeUtc(sourcePath) > File.GetLastWriteTimeUtc(destPath))
                         {
-                            File.Copy(sourcePath, destPath, overwrite: true);
+                            WritableFile.Copy(sourcePath, destPath);
                         }
                         currentManagedNonPkg.Add(destPath);
                     }
@@ -303,7 +303,7 @@ public class CacheBuilderService
             // Save the updated list of files PlumbobForge actively manages in SavedSims / Library
             try
             {
-                File.WriteAllLines(managedNonPkgFile, currentManagedNonPkg);
+                WritableFile.WriteAllLines(managedNonPkgFile, currentManagedNonPkg);
             }
             catch { }
 
@@ -364,22 +364,22 @@ public class CacheBuilderService
                         {
                             if (File.Exists(disabledPath))
                             {
-                                File.Move(disabledPath, enabledPath, overwrite: true);
+                                WritableFile.Move(disabledPath, enabledPath, overwrite: true);
                             }
                             else if (!File.Exists(enabledPath) && File.Exists(stagedWorldFile))
                             {
-                                File.Copy(stagedWorldFile, enabledPath, overwrite: true);
+                                WritableFile.Copy(stagedWorldFile, enabledPath);
                             }
                         }
                         else
                         {
                             if (File.Exists(enabledPath))
                             {
-                                File.Move(enabledPath, disabledPath, overwrite: true);
+                                WritableFile.Move(enabledPath, disabledPath, overwrite: true);
                             }
                             else if (!File.Exists(disabledPath) && File.Exists(stagedWorldFile))
                             {
-                                File.Copy(stagedWorldFile, disabledPath, overwrite: true);
+                                WritableFile.Copy(stagedWorldFile, disabledPath);
                             }
                         }
                     }
@@ -398,8 +398,8 @@ public class CacheBuilderService
                         {
                             string enPath = Path.Combine(gameWorldsDir, $"{delWorld}.world");
                             string disPath = Path.Combine(gameWorldsDir, $"{delWorld}.world.disabled");
-                            if (File.Exists(enPath)) File.Delete(enPath);
-                            if (File.Exists(disPath)) File.Delete(disPath);
+                            if (File.Exists(enPath)) WritableFile.Delete(enPath);
+                            if (File.Exists(disPath)) WritableFile.Delete(disPath);
                         }
                         catch { }
                     }
@@ -407,7 +407,7 @@ public class CacheBuilderService
 
                 try
                 {
-                    File.WriteAllLines(managedWorldsFile, currentManaged);
+                    WritableFile.WriteAllLines(managedWorldsFile, currentManaged);
                 }
                 catch { }
             }
@@ -483,7 +483,7 @@ public class CacheBuilderService
         }
         catch { }
 
-        File.WriteAllText(path, content);
+        WritableFile.WriteAllText(path, content);
         return true;
     }
 
@@ -613,7 +613,7 @@ public class CacheBuilderService
         try
         {
             string staticDir = Path.Combine(GetSims3FolderPath(), "Mods", "Cache", "StaticCache");
-            if (Directory.Exists(staticDir)) Directory.Delete(staticDir, true);
+            if (Directory.Exists(staticDir)) WritableFile.DeleteDirectory(staticDir);
         }
         catch { }
 
@@ -775,7 +775,7 @@ public class CacheBuilderService
                 foreach (var file in Directory.GetFiles(dir))
                 {
                     if (listed.Contains(Path.GetFullPath(file))) continue;
-                    try { File.Delete(file); } catch { }
+                    try { WritableFile.Delete(file); } catch { }
                 }
             }
         }
@@ -895,7 +895,7 @@ public class CacheBuilderService
                     if (!dirName.Equals("Config", StringComparison.OrdinalIgnoreCase) &&
                         !dirName.Equals("StaticCache", StringComparison.OrdinalIgnoreCase))
                     {
-                        try { Directory.Delete(dir, true); } catch { }
+                        try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
                 }
             }
@@ -1097,7 +1097,7 @@ public class CacheBuilderService
         {
             if (!Directory.Exists(path)) return false;
             Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
-            Directory.Delete(path, true);
+            WritableFile.DeleteDirectory(path);
             OnGameContentChanged();
             return true;
         }
@@ -1114,7 +1114,7 @@ public class CacheBuilderService
         await LoadDisabledObjectsAsync();
 
         Directory.CreateDirectory(path);
-        try { File.Delete(hashFile); } catch { }
+        try { WritableFile.Delete(hashFile); } catch { }
 
         var ctx = new MergeContext(path, "ModBUILD", CreateTextureCache(), null, onProgress) { DisabledObjects = _disabledObjects };
         DeleteStaleNewFiles(ctx);
@@ -1126,7 +1126,7 @@ public class CacheBuilderService
         FinalizeOutput(ctx);
         await _db.SaveChangesAsync();
 
-        File.WriteAllText(hashFile, hash);
+        WritableFile.WriteAllText(hashFile, hash);
         OnGameContentChanged();
         return true;
     }
@@ -1333,7 +1333,7 @@ public class CacheBuilderService
         {
             foreach (var path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.new"))
             {
-                try { File.Delete(path); } catch { }
+                try { WritableFile.Delete(path); } catch { }
             }
         }
         catch { }
@@ -1345,32 +1345,32 @@ public class CacheBuilderService
         {
             foreach (string path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.package"))
             {
-                try { File.Delete(path); } catch { }
+                try { WritableFile.Delete(path); } catch { }
             }
 
             foreach (string path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.new"))
             {
-                try { File.Move(path, Path.ChangeExtension(path, ".package"), overwrite: true); } catch { }
+                try { WritableFile.Move(path, Path.ChangeExtension(path, ".package"), overwrite: true); } catch { }
             }
 
             // Older versions exported patterns as separate files; they are merged into the bundles now.
             foreach (string path in Directory.GetFiles(ctx.OutputDir, "Pattern_*.package"))
             {
-                try { File.Delete(path); } catch { }
+                try { WritableFile.Delete(path); } catch { }
             }
         }
         catch { }
 
-        try { File.WriteAllText(Path.Combine(ctx.OutputDir, CacheLayoutFile), CacheLayoutVersion.ToString()); } catch { }
+        try { WritableFile.WriteAllText(Path.Combine(ctx.OutputDir, CacheLayoutFile), CacheLayoutVersion.ToString()); } catch { }
 
         string nonPackageFile = Path.Combine(ctx.OutputDir, "NonPackageItems.txt");
         if (ctx.NonPackageItems.Count > 0)
         {
-            try { File.WriteAllLines(nonPackageFile, ctx.NonPackageItems.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)); } catch { }
+            try { WritableFile.WriteAllLines(nonPackageFile, ctx.NonPackageItems.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)); } catch { }
         }
         else if (File.Exists(nonPackageFile))
         {
-            try { File.Delete(nonPackageFile); } catch { }
+            try { WritableFile.Delete(nonPackageFile); } catch { }
         }
     }
 
@@ -1580,7 +1580,7 @@ public class CacheBuilderService
                         insertIndex = priority + 1;
                     }
                     lines.Insert(insertIndex, configScanLine);
-                    File.WriteAllLines(mainResourceCfg, lines);
+                    WritableFile.WriteAllLines(mainResourceCfg, lines);
                 }
             }
             catch { }
