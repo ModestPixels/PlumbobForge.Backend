@@ -26,6 +26,8 @@ public sealed class CcMesh
     public int? ObjectMeshIndex { get; init; }
     // Objects: the diffuse texture, when it is in the package.
     public InspectedResource? Diffuse { get; init; }
+    // Objects: the texture compositor (TXTC) that paints the mesh, when it is in the package.
+    public InspectedResource? Compositor { get; init; }
     // Triangle count saved in the package, when working from a backup.
     public int? StoredTriangles { get; internal set; }
 
@@ -64,6 +66,12 @@ public sealed class CcAnalysis
 
     public List<CasPreset> ReadPresets(PackageInspection inspection)
     {
+        if (IsObject)
+        {
+            if (!Meshes.Any(m => m.Compositor != null)) return new List<CasPreset>();
+            try { return CcMaterial.ObjectPresets(inspection, Meshes.Select(m => m.Key.Instance).ToHashSet()); }
+            catch (Exception) { return new List<CasPreset>(); }
+        }
         if (Casp == null) return new List<CasPreset>();
         var own = TryReadPresets(inspection, Casp);
         if (own.Count > 0) return own;
@@ -114,14 +122,15 @@ public sealed class CcAnalysis
 
     public IReadOnlyList<int> Lods => Meshes.Select(m => m.Lod).Distinct().ToList();
 
-    // The top two levels; lower ones are left alone.
-    public IReadOnlyList<int> EditableLods
+    // Every level with a real mesh; converters often leave a lower one heavier than the level above.
+    public List<int> EditableLods
     {
         get
         {
             var all = Lods;
             var listed = all.Where(l => l != CcMesh.Unlisted).ToList();
-            return (listed.Count > 0 ? listed : all).Take(2).ToList();
+            var pool = listed.Count > 0 ? listed : all;
+            return pool.Where((l, i) => i < 2 || MeshesIn(l).Any(m => m.CanReduce && !m.IsPlaceholder)).ToList();
         }
     }
 
@@ -145,13 +154,14 @@ public sealed class CcAnalysis
     // Clothing and objects keep their open edges by default.
     public bool SuggestLockEdges => IsObject || Meshes.Any(m => m.Geom.HasVertexIds);
 
-    // Converters often copy the top level into the second one.
+    // Converters often copy the top level into the lower ones.
     public bool SuggestLinkSecondLod
     {
         get
         {
             var lods = EditableLods;
-            return lods.Count >= 2 && RealTrianglesIn(lods[1]) >= RealTrianglesIn(lods[0]) * 0.7;
+            return lods.Skip(1).Select((l, i) => (Own: RealTrianglesIn(l), Above: RealTrianglesIn(lods[i])))
+                .Any(p => p.Own >= p.Above * 0.7);
         }
     }
 }
@@ -160,7 +170,7 @@ public sealed class CcOptimizePlan
 {
     // Fraction of triangles to keep per level (missing = 1).
     public Dictionary<int, double> Ratios { get; } = new();
-    // Second level becomes half of the first.
+    // Each lower level becomes half of the one above.
     public bool LinkSecondLod { get; set; }
     public bool LockEdges { get; set; } = true;
 
@@ -172,17 +182,17 @@ public sealed class CcOptimizePlan
 
     public bool IsLinked(CcAnalysis analysis, int lod)
     {
-        var lods = analysis.EditableLods;
-        return LinkSecondLod && lods.Count >= 2 && lod == lods[1];
+        return LinkSecondLod && analysis.EditableLods.IndexOf(lod) >= 1;
     }
 
     public double RatioFor(CcAnalysis analysis, int lod)
     {
         if (IsLinked(analysis, lod))
         {
-            int first = analysis.EditableLods[0];
-            double target = analysis.MeshesIn(first).Where(m => !m.IsPlaceholder)
-                .Sum(m => m.Reduce(RatioFor(analysis, first), LockEdges).Triangles) / 2.0;
+            var lods = analysis.EditableLods;
+            int above = lods[lods.IndexOf(lod) - 1];
+            double target = analysis.MeshesIn(above).Where(m => !m.IsPlaceholder)
+                .Sum(m => m.Reduce(RatioFor(analysis, above), LockEdges).Triangles) / 2.0;
             int own = analysis.RealTrianglesIn(lod);
             return own > 0 ? Math.Clamp(Math.Floor(target / own * 100 + 0.5) / 100, 0.05, 1) : 1;
         }
@@ -204,12 +214,13 @@ public sealed record CcOptimizeResult(IReadOnlyList<CcMeshChange> Changes)
     public int TrianglesAfter => Changes.Sum(c => c.After);
 }
 
-// Lowers the triangle count of CC meshes. Ported from the web CC optimizer.
+// Lowers the triangle count of CC meshes.
 public class CcOptimizerService
 {
     private const uint Vpxy = 0x736884F1u;
     private const uint Casp = 0x034AEECBu;
     private const uint Objd = 0x319E4F1Du;
+    private const uint Txtc = 0x033A1435u;
     private const uint Mlod = 0x01D10F34u;
 
     // All objects of a package at once (colour variants share meshes).
@@ -397,9 +408,9 @@ public class CcOptimizerService
             inspection.Resources.FirstOrDefault(r => r.Key == key && r.PartIndex == part) ?? inspection.Resources.FirstOrDefault(r => r.Key == key);
 
         // Older materials often have the wrong group, so match by type and instance too.
-        InspectedResource? FindTexture(TGI_Key? key, int part)
+        InspectedResource? FindTexture(TGI_Key? key, int part, uint type = CcMaterial.TextureType)
         {
-            if (key is not { Type: CcMaterial.TextureType } k) return null;
+            if (key is not { } k || k.Type != type) return null;
             return Find(k, part)
                 ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance && r.PartIndex == part)
                 ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance);
@@ -493,6 +504,7 @@ public class CcOptimizerService
                     try
                     {
                         var g = model.ReadGeometry(i);
+                        var diffuseKey = model.DiffuseKey(i);
                         meshes.Add(new CcMesh
                         {
                             Resource = owner,
@@ -501,7 +513,8 @@ public class CcOptimizerService
                             Slot = slot++,
                             HasDuplicateKey = keyCounts[(owner.PartIndex, owner.Key)] > 1,
                             ObjectMeshIndex = i,
-                            Diffuse = FindTexture(model.DiffuseKey(i), owner.PartIndex),
+                            Diffuse = FindTexture(diffuseKey, owner.PartIndex),
+                            Compositor = FindTexture(diffuseKey, owner.PartIndex, Txtc),
                         });
                     }
                     catch (Exception ex)

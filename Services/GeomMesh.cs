@@ -14,7 +14,7 @@ public sealed record GeomVertexFormat(uint Usage, uint DataType, byte Size)
     public const uint DataTypeFloat = 1;
 }
 
-// TS3 GEOM mesh. Unchanged data is kept byte for byte. Ported from the web CC optimizer.
+// TS3 GEOM mesh. Unchanged data is kept byte for byte.
 public sealed class GeomMesh
 {
     public const uint ResourceType = 0x015A1849u;

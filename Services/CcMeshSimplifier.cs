@@ -7,7 +7,7 @@ namespace PlumbobForge.Backend.Services;
 
 public sealed record CcSimplifyResult(GeomMesh Geom, int Triangles, int Vertices, bool DoubleSided, IReadOnlyList<int>? Keep = null);
 
-// Triangle reduction with meshoptimizer, ported from the web CC optimizer. Double-sided hair is reduced on the front layer and the back is rebuilt as its mirror.
+// Triangle reduction with meshoptimizer. Double-sided hair is reduced on the front layer and the back is rebuilt as its mirror.
 public static class CcMeshSimplifier
 {
     private static readonly float[] AttributeWeights = { 0.5f, 0.5f, 0.5f, 1f, 1f }; // normal xyz, uv

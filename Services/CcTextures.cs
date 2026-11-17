@@ -5,12 +5,13 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using S3ForgeTools.GameFiles.Package;
 
 namespace PlumbobForge.Backend.Services;
 
 public sealed record RgbaImage(int Width, int Height, byte[] Rgba, string Label = "");
 
-// DDS decoding (DXT1/3/5, RGB(A)). Ported from the web CC optimizer.
+// DDS decoding (DXT1/3/5, RGB(A)).
 public static class DdsDecoder
 {
     public static RgbaImage Decode(byte[] bytes)
@@ -124,9 +125,10 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
     private static readonly Regex AttrRx = new(@"(\w+)=""([^""]*)""", RegexOptions.Compiled);
     private static readonly Regex ValueRx = new(@"<value ([^>]*?)/?>", RegexOptions.Compiled);
 
-    public static List<CasPreset> ReadAll(byte[] casp)
+    // CASPs hold UTF-16 text; object preset resources are UTF-8.
+    public static List<CasPreset> ReadAll(byte[] data, Encoding? encoding = null)
     {
-        string text = Encoding.Unicode.GetString(casp);
+        string text = (encoding ?? Encoding.Unicode).GetString(data);
         var list = new List<CasPreset>();
         foreach (Match m in PresetRx.Matches(text))
         {
@@ -138,7 +140,7 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
                 var at = Attrs(pm.Groups[1].Value);
                 var v = ParseValues(pm.Groups[2].Value);
                 string variable = at.GetValueOrDefault("variable") ?? "";
-                patterns[variable] = (at.GetValueOrDefault("name") ?? "", ParseColor(v.GetValueOrDefault("Color") ?? v.GetValueOrDefault("Color 0")));
+                patterns[variable] = (at.GetValueOrDefault("name") ?? "", ParseColor(v.GetValueOrDefault("Color") ?? v.GetValueOrDefault("Color 0")) ?? HsvColor(v));
                 return "";
             });
             var values = ParseValues(top);
@@ -167,6 +169,34 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
         return d;
     }
 
+    // Game paint patterns: a base colour shifted in HSV.
+    private static double[]? HsvColor(Dictionary<string, string> v)
+    {
+        double? N(string key) => v.TryGetValue(key, out var t) && double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : null;
+        if (N("Base H Bg") is not double h || N("Base S Bg") is not double sat || N("Base V Bg") is not double val) return null;
+        var shift = ParseColor(v.GetValueOrDefault("HSVShift Bg"));
+        if (shift is { Length: 3 } && shift.All(double.IsFinite))
+        {
+            h += shift[0];
+            sat += shift[1];
+            val += shift[2];
+        }
+        h -= Math.Floor(h);
+        sat = Math.Clamp(sat, 0, 1);
+        val = Math.Clamp(val, 0, 1);
+        double c = val * sat, x = c * (1 - Math.Abs(h * 6 % 2 - 1)), m = val - c;
+        var (r, g, b) = (int)(h * 6) switch
+        {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        return new[] { r + m, g + m, b + m };
+    }
+
     internal static double[]? ParseColor(string? s)
     {
         if (s == null) return null;
@@ -175,7 +205,7 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
     }
 }
 
-// Approximate in-game look for the preview (ported from the web CC optimizer).
+// Approximate in-game look for the preview.
 public static class CcMaterial
 {
     public const uint TextureType = 0x00B2D882u;
@@ -224,10 +254,25 @@ public static class CcMaterial
             for (int i = 3; i < rgba.Length; i += 4) rgba[i] = 255;
             return new RgbaImage(img.Width, img.Height, rgba, mode);
         }
+        // A compositor's base image can be the game's own; its overlay then goes over grey.
+        if (preset.Complate == CompositorName && !roles.ContainsKey("Multiplier"))
+            return roles.TryGetValue("Overlay", out var oe) ? OverGrey(Decode(oe)) : null;
         var result = preset.IsHair ? Hair(preset, roles, Decode) : Clothing(preset, roles, Decode);
         if (result != null && preset.IsHair && meshes != null) PaintSolidParts(result, preset, roles, Decode, meshes);
         if (result != null) BleedTransparent(result.Rgba);
         return result;
+    }
+
+    private static RgbaImage OverGrey(RgbaImage over)
+    {
+        var o = new byte[over.Rgba.Length];
+        for (int i = 0; i < o.Length; i += 4)
+        {
+            double a = over.Rgba[i + 3] / 255.0;
+            for (int k = 0; k < 3; k++) o[i + k] = ToByte(180 + (over.Rgba[i + k] - 180) * a);
+            o[i + 3] = 255;
+        }
+        return new RgbaImage(over.Width, over.Height, o, "Overlay on grey");
     }
 
     // Paints solid parts of a hair (like a hat) with the clothing colours.
@@ -256,6 +301,18 @@ public static class CcMaterial
         }
 
         var cs = Sampler(clothing, w, h)!;
+        // Converted hairs often have a solid inner layer over blank clothing images; that layer keeps the hair colour.
+        long area = 0, blank = 0;
+        for (int i = 0; i < w * h; i++)
+        {
+            if (!covered[i]) continue;
+            area++;
+            int q = cs(i);
+            var c = clothing.Rgba;
+            if (c[q + 3] < 16 || (c[q] > 235 && c[q + 1] > 235 && c[q + 2] > 235)) blank++;
+        }
+        if (blank * 2 > area) return;
+
         var o = hair.Rgba;
         for (int i = 0; i < w * h; i++)
         {
@@ -321,6 +378,18 @@ public static class CcMaterial
 
     private static double[]? Col(IReadOnlyDictionary<string, string> v, string key) => CasPreset.ParseColor(v.GetValueOrDefault(key));
 
+    // Base colour plus root, highlight and tip colours, as the preview paints them.
+    public static (double[] Base, double[]?[] Tints) HairColours(CasPreset preset)
+    {
+        var v = preset.Values;
+        var baseColor = Col(v, "Diffuse Color") ?? new[] { 0.4, 0.3, 0.2 };
+        var tints = new[] { Col(v, "Root Color"), Col(v, "Highlight Color"), Col(v, "Tip Color") };
+        if (!IsMarkerColours(tints.Prepend(baseColor))) return (baseColor, tints);
+        // The game paints hair in the Sim's own colour, so use its default brown.
+        return (new[] { 0.3765, 0.2196, 0.0863 },
+            new double[]?[] { new[] { 0.1882, 0.1490, 0.1098 }, new[] { 0.4667, 0.2863, 0.1686 }, new[] { 0.2863, 0.1882, 0.1176 } });
+    }
+
     private static RgbaImage? Hair(CasPreset preset, Dictionary<string, InspectedResource> roles, Func<InspectedResource, RgbaImage> decode)
     {
         var dEntry = roles.GetValueOrDefault("Diffuse Map") ?? roles.GetValueOrDefault("Multiplier");
@@ -329,9 +398,7 @@ public static class CcMaterial
         var ctrl = roles.TryGetValue("Control Map", out var ce) ? decode(ce) : null;
         int w = diff.Width, h = diff.Height;
         var cs = Sampler(ctrl, w, h);
-        var v = preset.Values;
-        var baseColor = Col(v, "Diffuse Color") ?? new[] { 0.4, 0.3, 0.2 };
-        var tints = new[] { Col(v, "Root Color"), Col(v, "Highlight Color"), Col(v, "Tip Color") };
+        var (baseColor, tints) = HairColours(preset);
         var o = new byte[w * h * 4];
         var c = new double[3];
         for (int i = 0; i < w * h; i++)
@@ -353,6 +420,28 @@ public static class CcMaterial
             o[d + 3] = diff.Rgba[d + 3];
         }
         return new RgbaImage(w, h, o, "Hair colour (approx.)");
+    }
+
+    // Some creators fill the hair colours with marker colours (red, green, blue...) to see the control map.
+    // That's a pure channel colour like #ff0000, or two bright non-hair hues (not red, brown or blonde) far apart.
+    private static bool IsMarkerColours(IEnumerable<double[]?> colours)
+    {
+        var hues = new List<double>();
+        foreach (var c in colours)
+        {
+            if (c == null) continue;
+            double max = c.Take(3).Max(), min = c.Take(3).Min();
+            if (max >= 0.85 && min <= 0.08 && c.Take(3).All(x => x <= 0.08 || x >= 0.85)) return true;
+            if (max < 0.25 || max - min < 0.3 * max) continue;
+            double d = max - min;
+            double hue = (max == c[0] ? (c[1] - c[2]) / d : max == c[1] ? 2 + (c[2] - c[0]) / d : 4 + (c[0] - c[1]) / d) * 60;
+            hue = (hue + 360) % 360;
+            if (hue > 60) hues.Add(hue);
+        }
+        for (int i = 0; i < hues.Count; i++)
+            for (int j = i + 1; j < hues.Count; j++)
+                if (Math.Min(Math.Abs(hues[i] - hues[j]), 360 - Math.Abs(hues[i] - hues[j])) >= 75) return true;
+        return false;
     }
 
     private static RgbaImage? Clothing(CasPreset preset, Dictionary<string, InspectedResource> roles, Func<InspectedResource, RgbaImage> decode)
@@ -398,6 +487,76 @@ public static class CcMaterial
             o[d] = ToByte(R); o[d + 1] = ToByte(G); o[d + 2] = ToByte(B); o[d + 3] = mult.Rgba[d + 3];
         }
         return new RgbaImage(w, h, o, "Preset colours (approx.)");
+    }
+
+    // TXTC property ids.
+    private const uint TxtcId = 0x687720A6, TxtcImage = 0xF6CC8471, TxtcSrcBlend = 0xE055EE36, TxtcDstBlend = 0x048F7567,
+        TxtcColorWrite = 0xB07B3B93, TxtcChannel = 0xD0E69002;
+
+    public const string CompositorName = "Texture compositor";
+    private const uint PresetXml = 0x0333406Cu;
+
+    // An object's preset XMLs. Their image keys are often stale, but their pattern colours match the compositor.
+    public static List<CasPreset> ObjectPresets(PackageInspection inspection, IReadOnlySet<ulong> modelInstances)
+    {
+        var all = inspection.Resources.Where(r => r.Key.Type == PresetXml)
+            .Select(r => (Res: r, Presets: CasPreset.ReadAll(inspection.Read(r), Encoding.UTF8)))
+            .Where(x => x.Presets.Count > 0)
+            .ToList();
+        var own = all.Where(x => modelInstances.Contains(x.Res.Key.Instance)).ToList();
+        if (own.Count == 0 && all.Count == 1) own = all;
+        return own.OrderBy(x => x.Res.Key.Group).SelectMany(x => x.Presets).ToList();
+    }
+
+    // The images an object's texture compositor (TXTC) draws from the package, as a preset:
+    // multiplied in = Multiplier, blended over = Overlay, split by channel = Mask. Pattern colours come from colours.
+    public static CasPreset? CompositorPreset(PackageInspection inspection, InspectedResource txtc, CasPreset? colours = null)
+    {
+        var d = inspection.Read(txtc);
+        if (d.Length < 9) return null;
+        int keysAt = 8 + BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(4));
+        if (keysAt < 8 || keysAt >= d.Length) return null;
+        int count = d[keysAt];
+        var keys = new List<TGI_Key>();
+        for (int i = 0; i < count && keysAt + 1 + i * 16 + 16 <= d.Length; i++)
+        {
+            int p = keysAt + 1 + i * 16;
+            keys.Add(new TGI_Key(BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(p + 12)), BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(p + 8)),
+                BinaryPrimitives.ReadUInt64LittleEndian(d.AsSpan(p))));
+        }
+        var inPackage = inspection.Resources.Where(r => r.Key.Type == TextureType).Select(r => r.Key.Instance).ToHashSet();
+
+        var steps = new List<int>();
+        for (int p = 0; p + 6 <= keysAt; p++)
+            if (BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(p)) == TxtcId && d[p + 4] == 0 && d[p + 5] == 7) steps.Add(p);
+
+        var values = new Dictionary<string, string>();
+        for (int s = 0; s < steps.Count; s++)
+        {
+            int from = steps[s], to = s + 1 < steps.Count ? steps[s + 1] : keysAt;
+            if (TxtcProp(d, from, to, TxtcImage, 0x0C, 1) is not int at || d[at] >= keys.Count) continue;
+            var key = keys[d[at]];
+            if (key.Type != TextureType || !inPackage.Contains(key.Instance)) continue;
+            int? src = TxtcProp(d, from, to, TxtcSrcBlend, 3, 4) is int a ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(a)) : null;
+            int? dst = TxtcProp(d, from, to, TxtcDstBlend, 3, 4) is int b ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(b)) : null;
+            int? write = TxtcProp(d, from, to, TxtcColorWrite, 3, 4) is int c ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(c)) : null;
+            string? role = TxtcProp(d, from, to, TxtcChannel, 0x0B, 16) != null ? "Mask"
+                : write != 7 ? null
+                : src == 8 && dst == 2 ? "Multiplier"
+                : src == 4 && dst == 5 ? "Overlay"
+                : null;
+            if (role != null && !values.ContainsKey(role)) values[role] = $"key:{TextureType:X8}:{key.Group:X8}:{key.Instance:X16}";
+        }
+        return values.Count == 0 ? null
+            : new CasPreset(CompositorName, values, colours?.Patterns ?? new Dictionary<string, CasPattern>());
+    }
+
+    // Offset of a property's value: id, a zero byte, the type, then the value.
+    private static int? TxtcProp(byte[] d, int from, int to, uint id, byte type, int size)
+    {
+        for (int p = from; p + 6 + size <= to; p++)
+            if (BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan(p)) == id && d[p + 4] == 0 && d[p + 5] == type) return p + 6;
+        return null;
     }
 
     // Whether the alpha should cut holes in these meshes. wrap: UVs repeat (objects).

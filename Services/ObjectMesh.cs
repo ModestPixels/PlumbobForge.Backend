@@ -320,7 +320,8 @@ public sealed record ObjectMeshEdit(IReadOnlyList<int> Keep, uint[] Indices);
 
 public sealed class MlodModel
 {
-    private const uint UvScalesParam = 0x420520E9u; // FNV-32 of "uvscales"
+    // Short UVs are /32767. The material's "uvscales" doesn't match the textures, so it isn't used.
+    private const float ShortUvScale = 1f / 32767f;
 
     public RcolFile Rcol { get; }
     public IReadOnlyDictionary<int, MlodChunk> Mlods { get; }
@@ -424,7 +425,7 @@ public sealed class MlodModel
         var posEl = layout.Find(VrtfElement.Position)!;
         var nrmEl = layout.Find(VrtfElement.Normal);
         var uvEl = layout.Find(VrtfElement.Uv);
-        float uvScale = UvScale(m);
+        float uvScale = ShortUvScale;
 
         var pos = new float[n * 3];
         float[]? nrm = nrmEl is { Format: VrtfElement.ColorUByte4 or VrtfElement.Float3 } ? new float[n * 3] : null;
@@ -517,27 +518,6 @@ public sealed class MlodModel
             }
         }
         return null;
-    }
-
-    private float UvScale(MlodMesh m)
-    {
-        const float fallback = 1f / 32767f;
-        int at = MaterialChunk(m);
-        if (at < 0) return fallback;
-        var c = Rcol.Chunks[at];
-        int mtnf = ParamBlock(c);
-        if (mtnf < 0) return fallback;
-        int count = (int)RcolFile.U32(c, mtnf + 12);
-        for (int i = 0; i < count && mtnf + 16 + i * 16 + 16 <= c.Length; i++)
-        {
-            int e = mtnf + 16 + i * 16;
-            if (RcolFile.U32(c, e) != UvScalesParam || RcolFile.U32(c, e + 4) != 1) continue;
-            int off = mtnf + (int)RcolFile.U32(c, e + 12);
-            if (off + 4 > c.Length) break;
-            float s = BinaryPrimitives.ReadSingleLittleEndian(c.AsSpan(off));
-            return s > 0 && float.IsFinite(s) ? s : fallback;
-        }
-        return fallback;
     }
 
     // Rebuilds only the buffers that hold reduced meshes.
