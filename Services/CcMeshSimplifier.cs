@@ -10,7 +10,10 @@ public sealed record CcSimplifyResult(GeomMesh Geom, int Triangles, int Vertices
 // Triangle reduction with meshoptimizer. Double-sided hair is reduced on the front layer and the back is rebuilt as its mirror.
 public static class CcMeshSimplifier
 {
-    private static readonly float[] AttributeWeights = { 0.5f, 0.5f, 0.5f, 1f, 1f }; // normal xyz, uv
+    // Normal xyz, uv, then skin weights folded into four numbers.
+    private static readonly float[] AttributeWeights = { 0.5f, 0.5f, 0.5f, 1f, 1f, SkinWeight, SkinWeight, SkinWeight, SkinWeight };
+    private const float SkinWeight = 5f;
+    private const int Stride = 9;
 
     public sealed class Layers
     {
@@ -141,18 +144,20 @@ public static class CcMeshSimplifier
         var pos = geom.GetFloats(GeomVertexFormat.UsagePosition, out _)!;
         var nrm = geom.GetFloats(GeomVertexFormat.UsageNormal, out int nrmN);
         var uvs = geom.GetFloats(GeomVertexFormat.UsageUv, out int uvN);
-        var (keep, newIdx) = SimplifyIndices(pos, nrm, nrmN, uvs, uvN, geom.Indices, geom.VertexCount, ratio, lockEdges, layers);
+        var (keep, newIdx) = SimplifyIndices(pos, nrm, nrmN, uvs, uvN, geom.Indices, geom.VertexCount, ratio, lockEdges, layers, Skin(geom));
         return new CcSimplifyResult(geom.WithGeometry(keep, newIdx), newIdx.Length / 3, keep.Count, layers.DoubleSided, keep);
     }
 
     public static (List<int> Keep, uint[] Indices) SimplifyIndices(float[] pos, float[]? nrm, int nrmN, float[]? uvs, int uvN,
-        uint[] indices, int n, double ratio, bool lockEdges, Layers layers)
+        uint[] indices, int n, double ratio, bool lockEdges, Layers layers, float[]? skin = null)
     {
-        var extra = new float[n * 5];
+        var extra = new float[n * Stride];
         for (int v = 0; v < n; v++)
         {
-            if (nrm != null && nrmN >= 3) { extra[v * 5] = nrm[v * nrmN]; extra[v * 5 + 1] = nrm[v * nrmN + 1]; extra[v * 5 + 2] = nrm[v * nrmN + 2]; }
-            if (uvs != null && uvN >= 2) { extra[v * 5 + 3] = uvs[v * uvN]; extra[v * 5 + 4] = uvs[v * uvN + 1]; }
+            int e = v * Stride;
+            if (nrm != null && nrmN >= 3) { extra[e] = nrm[v * nrmN]; extra[e + 1] = nrm[v * nrmN + 1]; extra[e + 2] = nrm[v * nrmN + 2]; }
+            if (uvs != null && uvN >= 2) { extra[e + 3] = uvs[v * uvN]; extra[e + 4] = uvs[v * uvN + 1]; }
+            if (skin != null) for (int k = 0; k < 4; k++) extra[e + 5 + k] = skin[v * 4 + k];
         }
 
         uint[] idx;
@@ -215,9 +220,52 @@ public static class CcMeshSimplifier
         fixed (float* p = pos, a = extra, w = AttributeWeights)
         {
             count = MeshOptimizer.SimplifyWithAttributes(d, src, (nuint)indices.Length, p, (nuint)vertexCount, 12,
-                a, 20, w, (nuint)AttributeWeights.Length, null, (nuint)target, 1.0f, options, &error);
+                a, Stride * 4, w, (nuint)AttributeWeights.Length, null, (nuint)target, 1.0f, options, &error);
         }
         return dest.AsSpan(0, (int)count).ToArray();
+    }
+
+    // Each bone gets its own direction and a vertex the blend of its bones, so merging vertices that
+    // follow different bones (a fingertip into the palm, a skirt into the leg) costs as much as a UV seam.
+    // Without this, posed Sims show stretched hands and clothes.
+    public static float[]? Skin(GeomMesh geom)
+    {
+        var bones = geom.GetRaw(GeomVertexFormat.UsageBoneIndices, out int bs);
+        if (bones == null || bs < 4 || geom.BoneHashes.Length < 2) return null;
+        var wf = geom.GetFloats(GeomVertexFormat.UsageBoneWeights, out int wn);
+        int wbs = 0;
+        var wb = wf == null ? geom.GetRaw(GeomVertexFormat.UsageBoneWeights, out wbs) : null;
+        if (wf == null && (wb == null || wbs < 4)) return null;
+        int n = geom.VertexCount;
+        var skin = new float[n * 4];
+        for (int v = 0; v < n; v++)
+        {
+            for (int k = 0; k < 4; k++)
+            {
+                float w = wf != null ? (k < wn ? wf[v * wn + k] : 0f) : wb![v * wbs + k] / 255f;
+                if (w <= 0) continue;
+                uint h = BoneDirectionSeed(bones[v * bs + k]);
+                for (int d = 0; d < 4; d++) skin[v * 4 + d] += w * BoneDirection(h, d);
+            }
+        }
+        return skin;
+    }
+
+    private static uint BoneDirectionSeed(int bone) => (uint)bone * 2654435761u + 0x9E3779B9u;
+
+    // A fixed unit-length direction per bone.
+    private static float BoneDirection(uint seed, int d)
+    {
+        Span<float> c = stackalloc float[4];
+        float len = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            uint x = seed + (uint)i * 0x85EBCA6Bu;
+            x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
+            c[i] = x / (float)uint.MaxValue * 2f - 1f;
+            len += c[i] * c[i];
+        }
+        return c[d] / MathF.Sqrt(len);
     }
 
     private static unsafe uint[] PositionRemap(float[] pos, int vertexCount)
